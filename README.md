@@ -1,2 +1,125 @@
-# mortis-action
-GitHub Action for reviewing pull requests with the Mortis CLI.
+# Mortis Action
+
+Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. The action installs Mortis Engine 0.1.1 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
+
+## Review pull requests
+
+Add a repository secret named `MORTIS_API_KEY` and select an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.1/#connect-with-environment-variables). Examples use `@main` for development. Pin Mortis Action to a reviewed commit SHA in production.
+
+```yaml
+name: Mortis PR review
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+permissions:
+  contents: read
+  pull-requests: write
+concurrency:
+  group: mortis-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: code-mortis/mortis-action@main
+        id: mortis
+        with:
+          provider: openai
+          model: ${{ vars.MORTIS_MODEL }}
+        env:
+          MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
+```
+
+The action reviews the exact PR head against its merge base and loads `mortis.toml` from the event’s **target commit**. It skips forks, drafts and Dependabot. Other bot-authored PRs require `include_bot_prs = true`. Publication uses the workflow’s GitHub token. Mortis updates one summary comment and posts confirmed findings inline when GitHub can anchor them to added lines. The summary lists findings whose lines GitHub cannot anchor, too.
+
+## Compare branches
+
+This workflow compares two refs available in the full checkout. Use a trusted base ref such as `origin/main`.
+
+```yaml
+name: Mortis branch review
+on:
+  workflow_dispatch:
+    inputs:
+      head:
+        description: Head ref to review, such as origin/my-branch
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: code-mortis/mortis-action@main
+        with:
+          base: origin/main
+          head: ${{ inputs.head }}
+          provider: openai
+          model: ${{ vars.MORTIS_MODEL }}
+        env:
+          MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
+```
+
+## Scan a revision
+
+Scan mode installs a checksum-verified Trivy 0.76.0 on Linux X64 and ARM64. Pass `ref` to select another local revision. The default is the commit that triggered the workflow.
+
+```yaml
+name: Mortis security scan
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: code-mortis/mortis-action@main
+        with:
+          command: scan
+          provider: openai
+          model: ${{ vars.MORTIS_MODEL }}
+        env:
+          MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
+```
+
+## Repository configuration and reports
+
+Commit `mortis.toml` at your repository root. Reviews read it from the base commit. Scans read it from the scanned commit. For example:
+
+```toml
+[review]
+automatic = true
+include_bot_prs = false
+language = "English"
+exclusions = "vendor/**, generated/**"
+effort = "medium"
+max_files = 40
+
+[scan]
+exclusions = "vendor/**"
+timeout_seconds = 600
+```
+
+The engine supplies defaults when the file is absent and rejects invalid configuration before contacting the provider. A model in the effective Engine settings takes precedence over the action’s `model` input. The provider preset and API key come from the workflow. Each invocation uses fresh local Engine state.
+
+The Actions summary shows status and coverage. The action exposes `status` (`completed`, `partial`, `failed`, or `skipped`), `run-id`, `report-json`, and `report-markdown`. Report outputs are runner-local paths for subsequent steps in the same job. Partial results keep their reports and return exit code 2. A later step can use `if: ${{ !cancelled() && steps.mortis.outputs.report-json != '' }}` to consume available reports, including after a failure. Reports may include source evidence. Successful analysis with findings exits 0.
+
+## Development
+
+Install `mortis-engine==0.1.1` and run `python -B -m unittest discover -s tests`. Tests exercise local Git fixtures and mock the provider and GitHub boundaries.

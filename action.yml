@@ -1,0 +1,55 @@
+name: Mortis
+description: Review Git changes and scan a repository with Mortis Engine
+inputs:
+  command:
+    description: "Mortis command: review or scan"
+    default: review
+  base:
+    description: Base Git ref for reviews outside pull requests
+  head:
+    description: Head Git ref for reviews outside pull requests
+  ref:
+    description: Git ref to scan (defaults to the workflow commit)
+  provider:
+    description: Mortis Engine API-key provider preset
+    default: openai
+  model:
+    description: Fallback model when the committed Mortis configuration has no model
+outputs:
+  status:
+    description: "Result status: completed, partial, failed, or skipped"
+    value: ${{ steps.mortis.outputs.status }}
+  run-id:
+    description: Engine run ID, when a report is available
+    value: ${{ steps.mortis.outputs.run-id }}
+  report-json:
+    description: Absolute path to the JSON report, when available
+    value: ${{ steps.mortis.outputs.report-json }}
+  report-markdown:
+    description: Absolute path to the Markdown report, when available
+    value: ${{ steps.mortis.outputs.report-markdown }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.13"
+    - id: mortis
+      name: Run Mortis
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        MORTIS_COMMAND: ${{ inputs.command }}
+        MORTIS_BASE: ${{ inputs.base }}
+        MORTIS_HEAD: ${{ inputs.head }}
+        MORTIS_REF: ${{ inputs.ref }}
+        MORTIS_PROVIDER: ${{ inputs.provider }}
+        MORTIS_MODEL: ${{ inputs.model }}
+        MORTIS_GITHUB_TOKEN: ${{ github.token }}
+      run: python -I "$GITHUB_ACTION_PATH/run_mortis.py"
+    - name: Set Mortis exit status
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        MORTIS_EXIT_CODE: ${{ steps.mortis.outputs.exit-code }}
+      run: exit "${MORTIS_EXIT_CODE:-1}"
