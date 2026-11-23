@@ -4,16 +4,16 @@ Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons
 
 ## Review pull requests
 
-1. Copy [the example workflow](examples/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
+1. Copy [the review workflow](.github/workflows/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
 2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.3/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
-3. Replace `@main` with a reviewed commit SHA for production use.
+3. Pin the action to a reviewed commit SHA. The workflow includes the SHA used by this repository.
 
 Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. Drafts and Dependabot PRs are skipped. Other bot-authored PRs require `include_bot_prs = true`.
 
 - Set the `MORTIS_REVIEW_FORKS` repository variable to `true` to enable automatic fork reviews. Fork activity can then trigger provider calls.
 - Set `MORTIS_UPLOAD_REPORTS` to `true` to retain JSON and Markdown as workflow artifacts for seven days. Reports can include source evidence.
 
-The example uses `pull_request_target` and `issue_comment` in a dedicated review workflow. The action fetches PR commits into a temporary bare Git repository and reads them as data. It compares the exact head to the merge base and loads `mortis.toml` from the **target commit**. Mortis updates one summary comment with the change overview, coverage, and confirmed findings. It also posts findings inline when GitHub can anchor them to added lines.
+The workflow uses `pull_request_target` and `issue_comment`. The action fetches PR commits into a temporary bare Git repository and reads them as data. It compares the exact head to the merge base and loads `mortis.toml` from the **target commit**. Mortis updates one summary comment with the change overview, coverage, and confirmed findings. It also posts findings inline when GitHub can anchor them to added lines.
 
 When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. Use **Commit suggestion** to apply the replacement to the PR branch.
 

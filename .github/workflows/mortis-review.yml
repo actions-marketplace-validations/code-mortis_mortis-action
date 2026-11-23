@@ -61,7 +61,7 @@ jobs:
       group: mortis-review-${{ github.event.pull_request.number || needs.authorize-comment.outputs.pr-number || format('skip-{0}', github.run_id) }}
       cancel-in-progress: true
     steps:
-      - uses: code-mortis/mortis-action@main
+      - uses: code-mortis/mortis-action@5a5459317154884de8a58c68d626ad34a59e747c
         id: mortis
         with:
           provider: openai
