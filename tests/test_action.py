@@ -12,14 +12,25 @@ import run_mortis as action
 
 def pr_event(base="base", head="head", *, draft=False, fork=False, login="contributor", author_type="User"):
     return {
+        "action": "opened",
         "sender": {"login": login},
         "pull_request": {
             "number": 42,
+            "state": "open",
             "draft": draft,
             "user": {"login": login, "type": author_type},
             "base": {"sha": base, "repo": {"full_name": "owner/repo"}},
             "head": {"sha": head, "repo": {"full_name": "user/fork" if fork else "owner/repo"}},
         },
+    }
+
+
+def comment_event(body="/mortis review"):
+    return {
+        "action": "created",
+        "sender": {"login": "maintainer"},
+        "issue": {"number": 42, "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/42"}},
+        "comment": {"body": body, "user": {"login": "maintainer", "type": "User"}},
     }
 
 
@@ -67,7 +78,7 @@ class RevisionTests(unittest.TestCase):
         self.git("commit", "-qm", "Fixture")
         return self.git("rev-parse", "HEAD")
 
-    def engine(self, *args):
+    def engine(self, *args, repo=None):
         return subprocess.run(
             [
                 sys.executable,
@@ -75,7 +86,7 @@ class RevisionTests(unittest.TestCase):
                 "from mortis_engine.cli import main; raise SystemExit(main())",
                 *args,
                 "--repo",
-                self.repo,
+                repo or self.repo,
             ],
             text=True,
             capture_output=True,
@@ -122,6 +133,32 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def test_bare_fetch_pins_refs_and_uses_target_policy(self):
+        base = self.commit({"keep.py": "x = 1\n", "mortis.toml": '[review]\nexclusions = "skip.py"\n'})
+        head = self.commit({"keep.py": "x = 2\n", "skip.py": "x = 3\n", "mortis.toml": '[review]\nexclusions = "keep.py"\n'})
+        self.git("update-ref", "refs/pull/42/head", head)
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (root / "owner").mkdir()
+        subprocess.run(["git", "clone", "--quiet", "--mirror", self.repo, root / "owner/repo.git"], check=True)
+        pr = pr_event(base, head, fork=True)["pull_request"]
+        repo = root / "fetch.git"
+        with patch.dict(os.environ, {
+            "GITHUB_SERVER_URL": root.as_uri(), "GITHUB_REPOSITORY": "owner/repo", "MORTIS_GITHUB_TOKEN": "test-token",
+        }):
+            args, revision = action.fetch_pull_request(repo, pr)
+            stale = {**pr, "head": {**pr["head"], "sha": base}}
+            stale_args, _ = action.fetch_pull_request(root / "stale.git", stale)
+
+        self.assertIsNone(stale_args)
+        self.assertEqual(revision, base)
+        self.assertFalse((repo / "mortis.toml").exists())
+        self.assertNotIn("extraheader", (repo / "config").read_text().lower())
+        result = self.engine(*args, "--preview", "--format", "json", repo=repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["head_sha"], head)
+        self.assertEqual({row["path"] for row in report["selected_files"]}, {"keep.py", "mortis.toml"})
+
 
 class ActionTests(unittest.TestCase):
     def setUp(self):
@@ -141,6 +178,7 @@ class ActionTests(unittest.TestCase):
                     "MORTIS_GITHUB_TOKEN": "test-github-token",
                     "GITHUB_SERVER_URL": "https://github.com",
                     "GITHUB_REPOSITORY": "owner/repo",
+                    "GITHUB_API_URL": "https://api.github.com",
                     "GITHUB_RUN_ID": "123",
                 },
             )
@@ -151,10 +189,68 @@ class ActionTests(unittest.TestCase):
             with self.subTest(details=details):
                 args, _ = action.select_run("review", "pull_request", pr_event(**details), "")
                 self.assertIsNone(args)
-        with self.assertRaisesRegex(ValueError, "Use pull_request"):
-            action.select_run("review", "pull_request_target", pr_event(), "")
 
-    def run_mock(self, command, settings, pr=None, *, invalid=False):
+    def test_comment_admission_checks_command_and_author_before_fetching_pr(self):
+        pr = pr_event(fork=True)["pull_request"]
+        with patch.object(action.GitHubAPI, "request") as request:
+            for body in ("Looks good", "/Mortis review", "/mortis review now"):
+                self.assertIsNone(action.remote_pull_request("issue_comment", comment_event(body))[0])
+            request.assert_not_called()
+
+            for permission in (None, {"permission": "read"}):
+                request.reset_mock()
+                request.return_value = permission
+                self.assertIsNone(action.remote_pull_request("issue_comment", comment_event())[0])
+                request.assert_called_once_with("GET", "/collaborators/maintainer/permission", allow_missing=True)
+
+            request.side_effect = [{"permission": "write"}, pr]
+            self.assertEqual(action.remote_pull_request("issue_comment", comment_event()), (pr, None))
+
+    def test_automatic_fork_review_is_opt_in_and_uses_event_shas(self):
+        event = pr_event(fork=True)
+        pr = event["pull_request"]
+        with patch.object(action.GitHubAPI, "request", return_value=pr) as request:
+            with patch.dict(os.environ, {"MORTIS_REVIEW_FORKS": "false"}):
+                self.assertIsNone(action.remote_pull_request("pull_request_target", event)[0])
+            with patch.dict(os.environ, {"MORTIS_REVIEW_FORKS": "true"}):
+                self.assertEqual(action.remote_pull_request("pull_request_target", event), (pr, None))
+                request.return_value = {**pr, "head": {**pr["head"], "sha": "new-head"}}
+                self.assertIsNone(action.remote_pull_request("pull_request_target", event)[0])
+
+    def test_comment_entrypoint_fetches_only_after_authorization(self):
+        event = self.directory / "event.json"
+        event.write_text(json.dumps(comment_event()))
+        base, head = "a" * 40, "b" * 40
+        pr = pr_event(base, head, fork=True)["pull_request"]
+        args = ["review", "--base", base, "--head", head]
+        environment = {
+            "RUNNER_OS": "Linux",
+            "RUNNER_TEMP": str(self.directory),
+            "GITHUB_EVENT_NAME": "issue_comment",
+            "GITHUB_EVENT_PATH": str(event),
+            "MORTIS_COMMAND": "review",
+        }
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(action.GitHubAPI, "request", return_value={"permission": "read"}) as request,
+            patch.object(action, "fetch_pull_request", return_value=(args, base)) as fetch,
+            patch.object(action, "run_engine", return_value=(0, "completed", "## Mortis review")) as engine,
+            patch("builtins.print"),
+        ):
+            action.main()
+            self.assertIn("status=skipped", self.outputs.read_text())
+            fetch.assert_not_called()
+            engine.assert_not_called()
+
+            request.side_effect = [{"permission": "write"}, pr]
+            action.main()
+            self.assertIn("status=completed", self.outputs.read_text())
+            repo, fetched_pr = fetch.call_args.args
+            self.assertEqual(fetched_pr, pr)
+            self.assertEqual(engine.call_args.args[:4], (args, repo, base, pr))
+            self.assertTrue(engine.call_args.kwargs["manual"])
+
+    def run_mock(self, command, settings, pr=None, *, invalid=False, manual=False):
         calls = []
         report = (
             review_report()
@@ -192,8 +288,9 @@ class ActionTests(unittest.TestCase):
         with (
             patch.object(action.subprocess, "run", side_effect=process),
             patch.object(action, "install_trivy") as trivy,
+            patch.object(action, "publish", return_value=True),
         ):
-            result = action.run_engine([command], ".", "base", pr, self.reports, self.directory)
+            result = action.run_engine([command], ".", "base", pr, self.reports, self.directory, manual=manual)
         return result, calls, trivy
 
     def test_automatic_and_bot_policy_skip_before_connect(self):
@@ -208,6 +305,12 @@ class ActionTests(unittest.TestCase):
     def test_invalid_config_fails_before_connect(self):
         with self.assertRaisesRegex(ValueError, "Invalid TOML"):
             self.run_mock("review", {}, invalid=True)
+
+    def test_manual_reviews_work_with_automatic_reviews_disabled(self):
+        result, _, _ = self.run_mock(
+            "review", {"automatic": False, "model": ""}, pr_event(fork=True)["pull_request"], manual=True
+        )
+        self.assertEqual(result[:2], (2, "partial"))
 
     def test_partial_scan_preserves_outputs_and_uses_configured_model(self):
         result, calls, trivy = self.run_mock("scan", {"model": "committed-model"})
@@ -238,16 +341,26 @@ class ActionTests(unittest.TestCase):
             "GITHUB_WORKSPACE": str(self.directory),
             "MORTIS_COMMAND": "scan",
         }
+        def engine(args, repo, revision, pr, reports, directory, *, manual):
+            for name, filename in (("report-json", "report.json"), ("report-markdown", "report.md")):
+                path = reports / filename
+                path.write_text("Partial report")
+                action.output(name, path)
+            (directory / "state").mkdir()
+            return 2, "partial", "## Mortis security scan"
+
         with (
             patch.dict(os.environ, environment),
             patch.object(action, "select_run", return_value=(["scan", "--ref", "base"], "base")),
-            patch.object(action, "run_engine", return_value=(2, "partial", "## Mortis security scan")) as run,
+            patch.object(action, "run_engine", side_effect=engine) as run,
             patch("builtins.print"),
         ):
             action.main()
         self.assertIn("status=partial\nexit-code=2\n", self.outputs.read_text())
         self.assertIn("Mortis security scan", Path(os.environ["GITHUB_STEP_SUMMARY"]).read_text())
-        self.assertTrue(run.call_args.args[-2].is_dir())
+        outputs = dict(line.split("=", 1) for line in self.outputs.read_text().splitlines())
+        for name in ("report-json", "report-markdown"):
+            self.assertEqual(Path(outputs[name]).read_text(), "Partial report")
         self.assertFalse(run.call_args.args[-1].exists())
 
 
@@ -259,18 +372,22 @@ class PublicationTests(unittest.TestCase):
         self.comments = []
         self.inline = []
         self.filename = "app.py"
+        self.diff_patch = "@@ -3,3 +3,3 @@\n context\n-previous\n+new\n context"
+        self.reject_suggestions = False
 
         def pages(path):
             if path == self.api.issue:
                 return iter(self.comments)
             if path.endswith("/files"):
-                patch = "@@ -3,3 +3,3 @@\n context\n-previous\n+new\n context"
-                return iter([{"filename": self.filename, "patch": patch}])
+                return iter([{"filename": self.filename, "patch": self.diff_patch}])
             return iter(self.inline)
 
         def request(method, path, payload, **kwargs):
             if path.endswith("/pulls/42/comments"):
+                if self.reject_suggestions and "```suggestion\n" in payload["body"]:
+                    return None
                 self.inline.append({"id": 3, "user": {"login": action.BOT}, **payload})
+                return self.inline[-1]
             elif method == "POST":
                 self.comments.append({"id": 2, "user": {"login": action.BOT}, **payload})
             else:
@@ -278,6 +395,15 @@ class PublicationTests(unittest.TestCase):
 
         self.api.pages.side_effect = pages
         self.api.request.side_effect = request
+
+    def set_suggestion(self, **overrides):
+        data = {
+            "source_sha": self.report["head_sha"],
+            "existing_code": "new\ncontext",
+            "suggestion_code": "    updated\ncontext\n",
+            "assessment": {"suggestion_supported": True},
+        }
+        self.report["findings"][0].update(data | overrides)
 
     def test_updates_only_bot_summary_and_deduplicates_inline(self):
         impostor = {"id": 1, "user": {"login": "human"}, "body": action.SUMMARY_MARKER}
@@ -296,6 +422,72 @@ class PublicationTests(unittest.TestCase):
         self.api.is_current.side_effect = [True, False]
         self.assertFalse(action.publish(self.api, self.report, "Stale summary"))
         self.api.request.assert_not_called()
+
+    def test_suggestion_replaces_the_exact_multiline_range(self):
+        self.set_suggestion()
+        self.assertTrue(action.publish(self.api, self.report, "Review summary"))
+        self.assertTrue(action.publish(self.api, self.report, "Review summary"))
+        self.assertEqual(len(self.inline), 1)
+        comment = self.inline[0]
+        self.assertIn("```suggestion\n    updated\ncontext\n```", comment["body"])
+        self.assertEqual((comment["start_line"], comment["line"]), (4, 5))
+        self.assertEqual((comment["start_side"], comment["side"]), ("RIGHT", "RIGHT"))
+        self.assertEqual(comment["commit_id"], self.report["head_sha"])
+
+    def test_single_line_suggestion_omits_range_start(self):
+        self.set_suggestion(end_line=4, existing_code="new", suggestion_code="updated")
+        self.assertTrue(action.publish(self.api, self.report, "Review summary"))
+        comment = self.inline[0]
+        self.assertIn("```suggestion\nupdated\n```", comment["body"])
+        self.assertEqual(comment["line"], 4)
+        self.assertNotIn("start_line", comment)
+        self.assertNotIn("start_side", comment)
+
+    def test_ineligible_suggestions_keep_the_plain_finding(self):
+        for overrides in (
+            {"existing_code": "ne\ncontext"},
+            {"end_line": 6, "existing_code": "new\ncontext\nmissing"},
+            {"assessment": {"suggestion_supported": False}},
+            {"suggestion_code": "updated\n```\n@everyone"},
+            {"suggestion_code": "x" * action.COMMENT_BODY_LIMIT},
+        ):
+            with self.subTest(fields=tuple(overrides)):
+                self.inline.clear()
+                self.set_suggestion(end_line=5)
+                self.report["findings"][0].update(overrides)
+                self.assertTrue(action.publish(self.api, self.report, "Review summary"))
+                self.assertEqual(self.inline[0]["line"], 4)
+                self.assertNotIn("```suggestion", self.inline[0]["body"])
+
+    def test_suggestion_cannot_span_two_diff_hunks(self):
+        self.diff_patch = "@@ -4 +4 @@\n-previous\n+new\n@@ -5 +5 @@\n-old context\n+context"
+        self.set_suggestion()
+        self.assertTrue(action.publish(self.api, self.report, "Review summary"))
+        self.assertNotIn("```suggestion", self.inline[0]["body"])
+
+    def test_rejected_suggestion_falls_back_to_plain_finding(self):
+        self.set_suggestion()
+        self.reject_suggestions = True
+        self.assertTrue(action.publish(self.api, self.report, "Review summary"))
+        suggested, fallback = self.api.request.call_args_list[-2:]
+        self.assertIn("```suggestion", suggested.args[2]["body"])
+        self.assertEqual(fallback.args[2]["line"], 4)
+        self.assertNotIn("```suggestion", fallback.args[2]["body"])
+        self.assertEqual(len(self.inline), 1)
+
+    def test_summary_includes_overview_and_escapes_model_text(self):
+        self.report["summary"] = {"result": {
+            "narrative": "Adds a retry",
+            "groups": [{"title": "Timeouts", "description": "Handles @everyone <b> safely", "paths": ["app.py"]}],
+        }}
+        self.assertTrue(action.publish(self.api, self.report, "Review summary"))
+        body = self.comments[0]["body"]
+        self.assertIn("Adds a retry", body)
+        self.assertIn("**Timeouts**", body)
+        self.assertIn("(app&#46;py)", body)
+        self.assertIn("### Findings", body)
+        self.assertNotIn("@everyone", body)
+        self.assertNotIn("<b>", body)
 
     def test_unavailable_patch_or_anchor_stays_in_summary(self):
         self.filename = "renamed.py"

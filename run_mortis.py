@@ -1,5 +1,6 @@
 """Run the pinned Mortis CLI and publish its confirmed review findings."""
 
+import base64
 import hashlib
 import http.client
 import json
@@ -11,10 +12,12 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 SUMMARY_MARKER = "<!-- mortis-action:review -->"
 BOT = "github-actions[bot]"
+COMMENT_BODY_LIMIT = 55_000
+REMOTE_REVIEW_EVENTS = {"pull_request_target", "issue_comment"}
 TRIVY_VERSION = "0.76.0"
 TRIVY_ASSETS = {
     "X64": ("64bit", "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7"),
@@ -33,21 +36,20 @@ def output(name, value):
     append("GITHUB_OUTPUT", f"{name}={value}")
 
 
-def resolve(repo, ref):
+def resolve(repo, ref, *, env=None):
     if not ref or ref.startswith("-"):
         raise ValueError("Supply a valid commit reference.")
     return subprocess.check_output(
         ["git", "-C", repo, "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
         text=True,
         stderr=subprocess.DEVNULL,
+        env=env,
     ).strip()
 
 
 def select_run(command, event_name, event, repo):
     if command not in {"review", "scan"}:
         raise ValueError("Set command to review or scan.")
-    if event_name == "pull_request_target":
-        raise ValueError("Use pull_request for Mortis reviews with provider credentials.")
     pr = event["pull_request"] if event_name == "pull_request" else None
     if pr:
         if pr["head"]["repo"] is None or pr["head"]["repo"]["full_name"] != pr["base"]["repo"]["full_name"]:
@@ -65,14 +67,82 @@ def select_run(command, event_name, event, repo):
         base, head = os.environ.get("MORTIS_BASE"), os.environ.get("MORTIS_HEAD")
         if not base or not head:
             raise ValueError("Supply base and head for a review outside a pull request.")
-    base, head = resolve(repo, base), resolve(repo, head)
-    shallow = subprocess.check_output(["git", "-C", repo, "rev-parse", "--is-shallow-repository"], text=True)
-    ancestor = subprocess.run(["git", "-C", repo, "merge-base", base, head], capture_output=True)
+    return review_range(repo, resolve(repo, base), resolve(repo, head))
+
+
+def review_range(repo, base, head, *, env=None):
+    shallow = subprocess.check_output(["git", "-C", repo, "rev-parse", "--is-shallow-repository"], text=True, env=env)
+    ancestor = subprocess.run(["git", "-C", repo, "merge-base", base, head], capture_output=True, env=env)
     if shallow.strip() == "true" or ancestor.returncode != 0:
         raise ValueError(
             "A review needs complete Git history and a common ancestor. Use checkout with fetch-depth: 0."
         )
     return ["review", "--base", base, "--head", head], base
+
+
+def remote_pull_request(event_name, event):
+    repository = os.environ["GITHUB_REPOSITORY"]
+    manual = event_name == "issue_comment"
+    if manual:
+        issue = event.get("issue", {})
+        comment = event.get("comment", {})
+        author = comment.get("user", {})
+        if (
+            event.get("action") != "created"
+            or not issue.get("pull_request")
+            or comment.get("body") != "/mortis review"
+            or author.get("type") != "User"
+        ):
+            return None, "No Mortis review command"
+        api = GitHubAPI(repository, issue["number"])
+        if not api.can_review(author["login"]):
+            return None, "Mortis review commands require repository write access"
+    else:
+        trigger = event["pull_request"]
+        api = GitHubAPI(repository, trigger["number"])
+
+    pr = api.request("GET", api.pull)
+    if pr["base"]["repo"]["full_name"] != repository:
+        raise ValueError("The pull request targets a different repository.")
+    if pr["state"] != "open" or pr["draft"]:
+        return None, "Draft or closed pull request"
+    if "dependabot[bot]" in {pr["user"]["login"], event["sender"]["login"]}:
+        return None, "Dependabot pull request"
+    if not manual:
+        head_repo = pr["head"]["repo"] or {}
+        allow_forks = os.environ.get("MORTIS_REVIEW_FORKS", "false").lower() == "true"
+        if head_repo.get("full_name") != repository and not allow_forks:
+            return None, "Automatic fork reviews are disabled"
+        if any(pr[side]["sha"] != trigger[side]["sha"] for side in ("base", "head")):
+            return None, "The PR changed after the event"
+    return pr, None
+
+
+def fetch_pull_request(repo, pr):
+    base, head = pr["base"]["sha"], pr["head"]["sha"]
+    if any(re.fullmatch(r"[0-9a-f]{40}", sha) is None for sha in (base, head)):
+        raise ValueError("GitHub did not return valid PR commit IDs.")
+    number = int(pr["number"])
+    url = f"{os.environ['GITHUB_SERVER_URL'].rstrip('/')}/{os.environ['GITHUB_REPOSITORY']}.git"
+    token = base64.b64encode(f"x-access-token:{os.environ['MORTIS_GITHUB_TOKEN']}".encode()).decode()
+    # Keep Git configuration and credentials scoped to this fetch.
+    env = {
+        "PATH": os.environ["PATH"],
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    subprocess.run(["git", "init", "--bare", "--quiet", "--template=", repo], check=True, env=env)
+    subprocess.run(
+        ["git", "-C", repo, "-c", "http.followRedirects=false",
+         "--config-env=http.extraHeader=MORTIS_GIT_AUTH", "fetch", "--quiet", "--no-tags", "--no-recurse-submodules",
+         url, f"{base}:refs/mortis/base", f"refs/pull/{number}/head:refs/mortis/head"],
+        check=True,
+        env={**env, "MORTIS_GIT_AUTH": f"Authorization: Basic {token}"},
+    )
+    if resolve(repo, "refs/mortis/base", env=env) != base or resolve(repo, "refs/mortis/head", env=env) != head:
+        return None, "The PR changed while fetching its commits"
+    return review_range(repo, base, head, env=env)
 
 
 def install_trivy(directory, environment):
@@ -113,17 +183,41 @@ def install_trivy(directory, environment):
     archive.unlink()
 
 
-def added_lines(patch):
+def right_side_lines(patch):
     line = None
-    for row in patch.splitlines():
+    hunk = 0
+    for row in patch.split("\n"):
         if row.startswith("@@"):
             match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", row)
             line = int(match[1]) if match else None
-        elif line is not None:
-            if row.startswith("+"):
-                yield line
-            if row.startswith(("+", " ")):
-                line += 1
+            hunk += 1
+        elif line is not None and row.startswith(("+", " ")):
+            yield line, (hunk, row[1:].removesuffix("\r"), row.startswith("+"))
+            line += 1
+
+
+def suggested_change(finding, head, lines):
+    if finding.get("source_sha") != head or not (finding.get("assessment") or {}).get("suggestion_supported"):
+        return None
+    existing = (finding.get("existing_code") or "").replace("\r\n", "\n").removesuffix("\n")
+    replacement = (finding.get("suggestion_code") or "").replace("\r\n", "\n").removesuffix("\n")
+    if not existing.strip() or not replacement.strip() or replacement == existing:
+        return None
+    if "\x00" in replacement or "\r" in replacement or any(
+        line.lstrip().startswith("```") for line in replacement.splitlines()
+    ):
+        return None
+
+    start, end = finding["start_line"], finding["end_line"]
+    original = existing.split("\n")
+    first = lines.get(start)
+    if first is None or len(original) != end - start + 1:
+        return None
+    for number, text in enumerate(original, start):
+        row = lines.get(number)
+        if row is None or row[:2] != (first[0], text):
+            return None
+    return f"\n\n```suggestion\n{replacement}\n```"
 
 
 def safe_text(value, limit):
@@ -161,7 +255,7 @@ class GitHubAPI:
         self.pull = f"/pulls/{int(number)}"
         self.issue = f"/issues/{int(number)}/comments"
 
-    def request(self, method, path, data=None, *, allow_invalid_anchor=False):
+    def request(self, method, path, data=None, *, allow_invalid_anchor=False, allow_missing=False):
         connection = http.client.HTTPSConnection(self.endpoint.netloc, timeout=30)
         try:
             connection.request(
@@ -177,6 +271,8 @@ class GitHubAPI:
             )
             response = connection.getresponse()
             body = response.read()
+            if response.status == 404 and allow_missing:
+                return None
             if response.status == 422 and allow_invalid_anchor:
                 return
             if not 200 <= response.status < 300:
@@ -203,18 +299,46 @@ class GitHubAPI:
             and pr["head"]["sha"] == report["head_sha"]
         )
 
+    def can_review(self, login):
+        url = f"/collaborators/{quote(login, safe='')}/permission"
+        access = self.request("GET", url, allow_missing=True)
+        return bool(access and access["permission"] in {"admin", "write", "maintain"})
+
+
+def overview(report):
+    result = ((report.get("summary") or {}).get("result") or {})
+    narrative = result.get("narrative")
+    body = f"\n\n{safe_text(narrative, 1200)}" if narrative else ""
+    groups = result.get("groups") or []
+    if groups:
+        body += "\n\n### Changes"
+        groups_text = ""
+        for group in groups:
+            paths = group["paths"]
+            files = ", ".join(safe_text(path, 160) for path in paths[:6])
+            if len(paths) > 6:
+                files += f" and {len(paths) - 6} more"
+            item = f"\n\n- **{safe_text(group['title'], 100)}** — {safe_text(group['description'], 280)}"
+            if files:
+                item += f"\n  ({files})"
+            if len((groups_text + item).encode()) > 12_000:
+                groups_text += "\n\nAdditional changes are available in the full report."
+                break
+            groups_text += item
+        body += groups_text
+    return body
+
 
 def publish(api, report, heading):
     if not api.is_current(report):
         return False
     findings = report["findings"]
-    body = f"{SUMMARY_MARKER}\n{heading}"
-    narrative = ((report.get("summary") or {}).get("result") or {}).get("narrative")
-    if narrative:
-        body += "\n\n" + safe_text(narrative, 1200)
+    body = f"{SUMMARY_MARKER}\n{heading}" + overview(report)
+    if findings:
+        body += "\n\n### Findings"
     for finding in findings:
         item = "\n\n- " + finding_text(finding)
-        if len((body + item).encode()) > 55_000:
+        if len((body + item).encode()) > COMMENT_BODY_LIMIT:
             body += "\n\nAdditional findings are available in the full report."
             break
         body += item
@@ -237,8 +361,8 @@ def publish(api, report, heading):
     if not findings:
         return True
     paths = {finding["path"] for finding in findings}
-    additions = {
-        file["filename"]: sorted(added_lines(file.get("patch") or ""))
+    diff = {
+        file["filename"]: dict(right_side_lines(file.get("patch") or ""))
         for file in api.pages(f"{api.pull}/files")
         if file["filename"] in paths
     }
@@ -250,13 +374,14 @@ def publish(api, report, heading):
     }
     for finding in findings:
         path = finding["path"]
-        line = next(
+        lines = diff.get(path, {})
+        line = min(
             (
-                line
-                for line in additions.get(path, ())
-                if finding["start_line"] <= line <= finding["end_line"]
+                number
+                for number, (_, _, added) in lines.items()
+                if added and finding["start_line"] <= number <= finding["end_line"]
             ),
-            None,
+            default=None,
         )
         if line is None or finding.get("source_sha", report["head_sha"]) != report["head_sha"]:
             continue
@@ -267,23 +392,30 @@ def publish(api, report, heading):
             continue
         if not api.is_current(report):
             return False
-        api.request(
-            "POST",
-            comments,
-            {
-                "body": f"{marker}\n{finding_text(finding)}",
-                "commit_id": report["head_sha"],
-                "path": path,
-                "line": line,
-                "side": "RIGHT",
-            },
-            allow_invalid_anchor=True,
-        )
+        payload = {
+            "body": f"{marker}\n{finding_text(finding)}",
+            "commit_id": report["head_sha"],
+            "path": path,
+            "line": line,
+            "side": "RIGHT",
+        }
+        suggestion = suggested_change(finding, report["head_sha"], lines)
+        posted = None
+        if suggestion and len((payload["body"] + suggestion).encode()) <= COMMENT_BODY_LIMIT:
+            start, end = finding["start_line"], finding["end_line"]
+            suggested = {**payload, "body": payload["body"] + suggestion, "line": end}
+            if start != end:
+                suggested.update(start_line=start, start_side="RIGHT")
+            posted = api.request("POST", comments, suggested, allow_invalid_anchor=True)
+            if posted is None and not api.is_current(report):
+                return False
+        if posted is None:
+            api.request("POST", comments, payload, allow_invalid_anchor=True)
         markers.add(marker)
     return True
 
 
-def run_engine(args, repo, revision, pr, reports, directory):
+def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -308,7 +440,7 @@ def run_engine(args, repo, revision, pr, reports, directory):
             "--no-input",
             "--index-url",
             "https://pypi.org/simple",
-            "mortis-engine==0.1.1",
+            "mortis-engine==0.1.3",
         ],
         check=True,
         env=environment,
@@ -325,7 +457,7 @@ def run_engine(args, repo, revision, pr, reports, directory):
     command = args[0]
     settings = json.loads(config.stdout)[command]["settings"]
     if command == "review" and pr:
-        if not settings["automatic"]:
+        if not manual and not settings["automatic"]:
             return 0, "skipped", "Automatic review disabled in mortis.toml"
         if pr["user"]["type"] == "Bot" and not settings["include_bot_prs"]:
             return 0, "skipped", "Bot reviews disabled in mortis.toml"
@@ -384,21 +516,26 @@ def main():
         command = os.environ["MORTIS_COMMAND"]
         event_name = os.environ["GITHUB_EVENT_NAME"]
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-        repo = os.environ["GITHUB_WORKSPACE"]
-        args, revision = select_run(command, event_name, event, repo)
-        if args is None:
-            code, status, message = 0, "skipped", revision
-        else:
-            with tempfile.TemporaryDirectory(prefix="mortis-work-", dir=os.environ["RUNNER_TEMP"]) as scratch:
-                # Keep reports readable by later steps while removing provider configuration and local history.
-                directory = Path(tempfile.mkdtemp(prefix="mortis-", dir=os.environ["RUNNER_TEMP"]))
+        runner_temp = os.environ["RUNNER_TEMP"]
+        with tempfile.TemporaryDirectory(prefix="mortis-work-", dir=runner_temp) as scratch:
+            directory = Path(scratch)
+            if event_name in REMOTE_REVIEW_EVENTS:
+                if command != "review":
+                    raise ValueError("This event supports only Mortis PR reviews.")
+                pr, reason = remote_pull_request(event_name, event)
+                repo = directory / "review.git"
+                args, revision = fetch_pull_request(repo, pr) if pr else (None, reason)
+            else:
+                pr = event.get("pull_request") if event_name == "pull_request" else None
+                repo = os.environ["GITHUB_WORKSPACE"]
+                args, revision = select_run(command, event_name, event, repo)
+            if args is None:
+                code, status, message = 0, "skipped", revision
+            else:
+                # Runner-local outputs must outlive the temporary Engine state.
+                reports = Path(tempfile.mkdtemp(prefix="mortis-reports-", dir=runner_temp))
                 code, status, message = run_engine(
-                    args,
-                    repo,
-                    revision,
-                    event.get("pull_request") if event_name == "pull_request" else None,
-                    directory,
-                    Path(scratch),
+                    args, repo, revision, pr, reports, directory, manual=event_name == "issue_comment"
                 )
     except subprocess.CalledProcessError as error:
         code, status, message = (
@@ -406,7 +543,7 @@ def main():
             "failed",
             f"Setup or Git failed (exit {error.returncode}). Check checkout, refs and setup logs.",
         )
-    except (KeyError, OSError, ValueError, tarfile.TarError) as error:
+    except (KeyError, OSError, ValueError, http.client.HTTPException, tarfile.TarError) as error:
         code, status, message = 1, "failed", str(error)
     if key := os.environ.get("MORTIS_API_KEY"):
         message = message.replace(key, "[redacted]")

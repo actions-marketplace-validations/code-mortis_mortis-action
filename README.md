@@ -1,40 +1,23 @@
 # Mortis Action
 
-Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. The action installs Mortis Engine 0.1.1 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
+Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. The action installs Mortis Engine 0.1.3 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
 
 ## Review pull requests
 
-Add a repository secret named `MORTIS_API_KEY` and select an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.1/#connect-with-environment-variables). Examples use `@main` for development. Pin Mortis Action to a reviewed commit SHA in production.
+1. Copy [the example workflow](examples/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
+2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.3/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
+3. Replace `@main` with a reviewed commit SHA for production use.
 
-```yaml
-name: Mortis PR review
-on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review]
-permissions:
-  contents: read
-  pull-requests: write
-concurrency:
-  group: mortis-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-jobs:
-  review:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: code-mortis/mortis-action@main
-        id: mortis
-        with:
-          provider: openai
-          model: ${{ vars.MORTIS_MODEL }}
-        env:
-          MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
-```
+Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. Drafts and Dependabot PRs are skipped. Other bot-authored PRs require `include_bot_prs = true`.
 
-The action reviews the exact PR head against its merge base and loads `mortis.toml` from the event’s **target commit**. It skips forks, drafts and Dependabot. Other bot-authored PRs require `include_bot_prs = true`. Publication uses the workflow’s GitHub token. Mortis updates one summary comment and posts confirmed findings inline when GitHub can anchor them to added lines. The summary lists findings whose lines GitHub cannot anchor, too.
+- Set the `MORTIS_REVIEW_FORKS` repository variable to `true` to enable automatic fork reviews. Fork activity can then trigger provider calls.
+- Set `MORTIS_UPLOAD_REPORTS` to `true` to retain JSON and Markdown as workflow artifacts for seven days. Reports can include source evidence.
+
+The example uses `pull_request_target` and `issue_comment` in a dedicated review workflow. The action fetches PR commits into a temporary bare Git repository and reads them as data. It compares the exact head to the merge base and loads `mortis.toml` from the **target commit**. Mortis updates one summary comment with the change overview, coverage, and confirmed findings. It also posts findings inline when GitHub can anchor them to added lines.
+
+When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. Use **Commit suggestion** to apply the replacement to the PR branch.
+
+Existing `pull_request` workflows can continue reviewing same-repository PRs with their full checkout.
 
 ## Compare branches
 
@@ -122,4 +105,4 @@ The Actions summary shows status and coverage. The action exposes `status` (`com
 
 ## Development
 
-Install `mortis-engine==0.1.1` and run `python -B -m unittest discover -s tests`. Tests exercise local Git fixtures and mock the provider and GitHub boundaries.
+Install `mortis-engine==0.1.3` and run `python -B -m unittest discover -s tests`. Tests exercise local Git fixtures and mock the provider and GitHub boundaries.
