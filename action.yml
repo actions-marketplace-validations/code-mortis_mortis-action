@@ -13,6 +13,10 @@ inputs:
   provider:
     description: Mortis Engine API-key provider preset
     default: openai
+  protocol:
+    description: Optional API protocol override for the provider preset
+  base-url:
+    description: Optional API base URL override for the provider preset
   model:
     description: Fallback model when the committed Mortis configuration has no model
   review-forks:
@@ -47,6 +51,8 @@ runs:
         MORTIS_HEAD: ${{ inputs.head }}
         MORTIS_REF: ${{ inputs.ref }}
         MORTIS_PROVIDER: ${{ inputs.provider }}
+        MORTIS_PROTOCOL: ${{ inputs.protocol }}
+        MORTIS_BASE_URL: ${{ inputs.base-url }}
         MORTIS_MODEL: ${{ inputs.model }}
         MORTIS_REVIEW_FORKS: ${{ inputs.review-forks }}
         MORTIS_GITHUB_TOKEN: ${{ github.token }}
