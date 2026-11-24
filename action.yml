@@ -1,5 +1,8 @@
 name: Mortis Review and Scan
 description: Review Git changes and scan a repository with Mortis Engine
+branding:
+  icon: shield
+  color: purple
 inputs:
   command:
     description: "Mortis command: review or scan"
