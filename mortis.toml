@@ -1,5 +1,5 @@
 [review]
-review_sensitivity = "high"
+review_sensitivity = "broad"
 effort = "medium"
 max_files = 100
 concurrency = 4
