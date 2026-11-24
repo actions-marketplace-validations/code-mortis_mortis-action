@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from .github import BOT, COMMENT_BODY_LIMIT, finding_metadata
-from .markdown import overview, safe_text
+from .markdown import earlier_open_findings, overview, safe_text
 
 SUMMARY_MARKER = "<!-- mortis-action:review -->"
 
@@ -79,25 +79,33 @@ def finding_text(finding):
     )
 
 
+def finding_list(label, findings, limit):
+    if not findings:
+        return ""
+    body = f"\n\n### {label}"
+    for finding in findings:
+        item = "\n\n- " + finding_text(finding)
+        if len((body + item).encode()) > limit - 80:
+            return body + "\n\nAdditional findings are available in the full report."
+        body += item
+    return body
+
+
 def publish(api, report, heading, *, repo=None, workflow_python=None, threads=None):
     if not api.is_current(report):
         return False
     findings = report["findings"]
     body = f"{SUMMARY_MARKER}\n{heading}" + overview(report)
-    if findings:
-        body += "\n\n### Findings"
-    for finding in findings:
-        item = "\n\n- " + finding_text(finding)
-        if len((body + item).encode()) > COMMENT_BODY_LIMIT:
-            body += "\n\nAdditional findings are available in the full report."
-            break
-        body += item
+    available = COMMENT_BODY_LIMIT - len(body.encode())
+    prior = earlier_open_findings(report)
+    earlier = finding_list("Earlier open findings", prior, available // 2 if findings else available)
+    body += finding_list("Findings", findings, available - len(earlier.encode())) + earlier
 
     existing = next(
         (
             row
             for row in api.pages(api.issue)
-            if row["user"]["login"] == BOT and row["body"].startswith(SUMMARY_MARKER)
+            if (row.get("user") or {}).get("login") == BOT and row["body"].startswith(SUMMARY_MARKER)
         ),
         None,
     )

@@ -33,9 +33,17 @@ The workflow uses `pull_request_target` and `issue_comment`. The action fetches 
 
 When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. For workflow files, Mortis also checks that the resulting YAML parses and has unique mapping keys. Use **Commit suggestion** to apply the replacement to the PR branch.
 
-GitHub thread resolution requires a future Engine release with `review --prior-findings`. With that release, set `auto_resolve = true` under `[review]` in the target branch's `mortis.toml` to verify earlier inline findings on the next review. Mortis reuses its open threads and resolves one only after the Engine verifies the fix against the current PR head. Threads posted before finding IDs were recorded, or whose original commit is unavailable, stay open.
+Set `auto_resolve = true` under `[review]` in the target branch's `mortis.toml` to verify findings carried by incremental review history. Mortis resolves a matching GitHub thread only after the Engine verifies the fix against the current PR head. Resolving threads from GitHub comments alone requires an Engine release with `review --prior-findings`.
 
 Existing `pull_request` workflows can continue reviewing same-repository PRs with their full checkout.
+
+### Incremental pull request reviews
+
+Set `incremental = true` under `[review]` in the target branch's `mortis.toml`. The first run reviews the full PR. Subsequent runs analyze files that changed since the last compatible, fully covered review and reuse coverage for the other files. Set `skip_unchanged = true` to skip review analysis when the head tree is identical. The job summary and PR comment list reviewed and reused files. The PR comment also keeps earlier open findings from the saved history.
+
+Generate a key with `openssl rand -base64 32` and store it as the `MORTIS_STATE_KEY` repository secret. The bundled workflow passes the key to the action and grants `actions: read`. For a custom workflow, add those settings and serialize review jobs per PR using a concurrency group. Use an action revision that includes incremental review support.
+
+Each PR's finalized review history is encrypted and stored as a workflow artifact for the repository's configured retention period. A missing or incompatible baseline triggers a full review. Keep the encryption key stable across runs to restore earlier findings.
 
 ## Compare branches
 
@@ -117,7 +125,7 @@ exclusions = "vendor/**"
 timeout_seconds = 600
 ```
 
-The engine supplies defaults when the file is absent and rejects invalid configuration before contacting the provider. A model in the effective Engine settings takes precedence over the action’s `model` input. The provider preset and API key come from the workflow. Use the optional `protocol` and `base-url` inputs to override the preset’s connection settings. Each invocation uses fresh local Engine state.
+The engine supplies defaults when the file is absent and rejects invalid configuration before contacting the provider. A model in the effective Engine settings takes precedence over the action’s `model` input. The provider preset and API key come from the workflow. Use the optional `protocol` and `base-url` inputs to override the preset’s connection settings.
 
 The Actions summary shows status and coverage. The action exposes `status` (`completed`, `partial`, `failed`, or `skipped`), `run-id`, `report-json`, and `report-markdown`. Report outputs are runner-local paths for subsequent steps in the same job. Partial results keep their reports and return exit code 2. A later step can use `if: ${{ !cancelled() && steps.mortis.outputs.report-json != '' }}` to consume available reports, including after a failure. Reports may include source evidence. Successful analysis with findings exits 0.
 

@@ -14,7 +14,16 @@ from pathlib import Path
 if sys.flags.isolated:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mortis_action import commands, events, github, markdown, repository, review, trivy
+from mortis_action import (
+    baseline,
+    commands,
+    events,
+    github,
+    markdown,
+    repository,
+    review,
+    trivy,
+)
 
 
 def append(path, message):
@@ -29,7 +38,7 @@ def output(name, value):
 
 
 def redact_credentials(message):
-    secrets = (os.environ.get("MORTIS_API_KEY", ""), os.environ.get("MORTIS_GITHUB_TOKEN", ""))
+    secrets = (os.environ.get(name, "") for name in ("MORTIS_API_KEY", "MORTIS_GITHUB_TOKEN", "MORTIS_STATE_KEY"))
     for secret in sorted(filter(None, secrets), key=len, reverse=True):
         message = message.replace(secret, "[redacted]")
     return message
@@ -51,7 +60,7 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     environment = {
         name: value
         for name, value in os.environ.items()
-        if name not in {"MORTIS_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "MORTIS_API_KEY"}
+        if name not in {"MORTIS_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "MORTIS_API_KEY", "MORTIS_STATE_KEY"}
     }
     environment.update(
         XDG_CONFIG_HOME=str(directory / "config"),
@@ -61,8 +70,11 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     subprocess.run([sys.executable, "-I", "-m", "venv", directory / "venv"], check=True, env=environment)
     bin_dir = directory / "venv/bin"
     packages = ["mortis-engine==0.1.5"]
-    if pr and args[0] == "review":
+    state_secret = os.environ.get("MORTIS_STATE_KEY", "")
+    if pr and command == "review":
         packages.append("PyYAML==6.0.3")
+        if state_secret:
+            packages.append("cryptography==50.0.2")
     subprocess.run(
         [
             bin_dir / "python",
@@ -144,6 +156,19 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     threads = {}
     resolution_note = ""
     prior_args = []
+    checkpoint = None
+    restored = False
+    state_note = ""
+    if api and (settings.get("incremental") or settings.get("skip_unchanged")):
+        try:
+            checkpoint = baseline.ReviewBaseline(api, bin_dir / "python", repo, environment, state_secret)
+        except ValueError:
+            state_note = "\n\nSet MORTIS_STATE_KEY to a base64-encoded 32-byte secret to save incremental review history."
+        if checkpoint is not None:
+            try:
+                restored = checkpoint.restore(pr["base"]["sha"], pr["head"]["sha"])
+            except (ValueError, OSError, http.client.HTTPException):
+                state_note = "\n\nReview history could not be restored. Check Actions read permissions and the state key."
     if api and settings.get("auto_resolve"):
         if "--prior-findings" in mortis("review", "--help").stdout:
             threads = api.finding_threads()
@@ -166,6 +191,11 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                 prior_args = ["--prior-findings", prior_path]
             if not all(available.values()):
                 resolution_note = "\n\nSome Mortis threads have an unavailable original commit and remain open."
+        elif restored:
+            try:
+                threads = api.finding_threads()
+            except (ValueError, OSError, http.client.HTTPException):
+                resolution_note = "\n\nMortis could not load the GitHub threads for automatic resolution."
         else:
             resolution_note = "\n\nThe installed Mortis Engine does not support PR finding verification."
     report_json = reports / "report.json"
@@ -182,13 +212,22 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     output("run-id", report["run_id"])
     status = "partial" if result.returncode == 2 else "failed" if result.returncode else report["status"]
     url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-    heading = markdown.summary(report, status, url) + resolution_note
+    heading = markdown.summary(report, status, url) + resolution_note + state_note
     if api:
         try:
-            if not review.publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python", threads=threads):
+            published = review.publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python", threads=threads)
+            if not published:
                 heading += "\n\nThe PR changed during the run. Results apply to the recorded commit."
         except (ValueError, OSError, http.client.HTTPException) as error:
             return result.returncode or 1, "failed", f"{heading}\n\nPR publication failed. {error}"
+        if published and checkpoint is not None:
+            try:
+                if api.is_current(report):
+                    path = checkpoint.save(report["run_id"], reports)
+                    output("baseline-name", checkpoint.name)
+                    output("baseline-path", path)
+            except (ValueError, OSError, http.client.HTTPException, subprocess.CalledProcessError):
+                heading += "\n\nMortis could not save the review history for the next run."
     if status in {"failed", "partial"}:
         diagnostics = [
             *report.get("problems", []),

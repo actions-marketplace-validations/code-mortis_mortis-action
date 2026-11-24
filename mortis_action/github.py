@@ -6,6 +6,7 @@ import json
 import os
 import re
 from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 
 BOT = "github-actions[bot]"
 COMMENT_BODY_LIMIT = 55_000
@@ -60,6 +61,16 @@ class GitHubAPI:
         if response.get("errors") or not response.get("data"):
             raise ValueError("GitHub could not read or resolve Mortis review threads. Check pull-requests permissions.")
         return response["data"]
+
+    def download_artifact(self, artifact_id, limit):
+        url = f"{self.endpoint.geturl().rstrip('/')}{self.repo}/actions/artifacts/{artifact_id}/zip"
+        request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "mortis-action"})
+        request.add_unredirected_header("Authorization", f"Bearer {os.environ['MORTIS_GITHUB_TOKEN']}")
+        with urlopen(request, timeout=30) as response:
+            archive = response.read(limit + 1)
+        if len(archive) > limit:
+            raise ValueError("The GitHub baseline archive exceeds the download limit.")
+        return archive
 
     def finding_threads(self):
         query = """

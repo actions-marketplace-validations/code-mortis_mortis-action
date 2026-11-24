@@ -5,10 +5,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import run_mortis as runner
-from mortis_action import events, github, repository, review
+from mortis_action import baseline, events, github, repository, review
 from mortis_action import trivy as scanner
 from tests.helpers import ActionTestCase, comment_event, pr_event, review_report
 
@@ -126,6 +126,7 @@ class RunnerTests(ActionTestCase):
         def process(argv, **kwargs):
             calls.append(argv)
             self.assertNotIn("MORTIS_GITHUB_TOKEN", kwargs["env"])
+            self.assertNotIn("MORTIS_STATE_KEY", kwargs["env"])
             if Path(argv[0]).name != "mortis":
                 return subprocess.CompletedProcess(argv, 0)
             if argv[1] == "config":
@@ -171,6 +172,37 @@ class RunnerTests(ActionTestCase):
         self.assertEqual(result[:2], (2, "partial"))
         self.assertNotIn("--prior-findings", calls[-1])
         self.assertIn("does not support PR finding verification", result[2])
+
+    def test_pr_review_restores_and_stages_encrypted_history_on_partial_results(self):
+        pr = pr_event("a" * 40, "b" * 40)["pull_request"]
+        settings = {"automatic": True, "include_bot_prs": False, "incremental": True, "model": ""}
+        checkpoint = Mock()
+        checkpoint.name = "mortis-pr-42"
+        checkpoint.save.return_value = self.reports / "baseline.enc"
+        with (
+            patch.dict(os.environ, {"MORTIS_STATE_KEY": "test-state-key"}),
+            patch.object(baseline, "ReviewBaseline", return_value=checkpoint),
+            patch.object(github.GitHubAPI, "is_current", return_value=True),
+        ):
+            result, calls, _ = self.run_mock("review", settings, pr)
+
+        self.assertEqual(result[:2], (2, "partial"))
+        self.assertTrue(any("cryptography==50.0.2" in call for call in calls))
+        checkpoint.restore.assert_called_once_with("a" * 40, "b" * 40)
+        checkpoint.save.assert_called_once_with("review-1", self.reports)
+        self.assertIn("baseline-name=mortis-pr-42", self.outputs.read_text())
+        self.assertIn(f"baseline-path={checkpoint.save.return_value}", self.outputs.read_text())
+
+    def test_incremental_without_a_key_still_reviews_the_pr(self):
+        pr = pr_event("a" * 40, "b" * 40)["pull_request"]
+        settings = {"automatic": True, "include_bot_prs": False, "incremental": True, "model": ""}
+        with patch.dict(os.environ, {"MORTIS_STATE_KEY": ""}):
+            result, calls, _ = self.run_mock("review", settings, pr)
+
+        self.assertEqual(result[:2], (2, "partial"))
+        self.assertIn("Set MORTIS_STATE_KEY", result[2])
+        self.assertFalse(any("cryptography==50.0.2" in call for call in calls))
+        self.assertNotIn("baseline-path=", self.outputs.read_text())
 
     def test_automatic_and_bot_policy_skip_before_connect(self):
         for settings in ({"automatic": False}, {"automatic": True, "include_bot_prs": False}):

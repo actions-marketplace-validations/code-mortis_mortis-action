@@ -60,6 +60,15 @@ runs:
         MORTIS_REVIEW_FORKS: ${{ inputs.review-forks }}
         MORTIS_GITHUB_TOKEN: ${{ github.token }}
       run: python -I "$GITHUB_ACTION_PATH/run_mortis.py"
+    - name: Save Mortis review history
+      if: ${{ steps.mortis.outputs.baseline-path != '' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.mortis.outputs.baseline-name }}
+        path: ${{ steps.mortis.outputs.baseline-path }}
+        overwrite: true
+        compression-level: 0
+        if-no-files-found: error
     - name: Set Mortis exit status
       shell: bash
       working-directory: ${{ runner.temp }}

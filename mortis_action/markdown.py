@@ -32,16 +32,46 @@ def overview(report):
     return body
 
 
+def file_list(label, files):
+    body = f"\n\n<details>\n<summary>{label} ({len(files)})</summary>\n"
+    size = 0
+    for file in files:
+        item = f"\n- {safe_text(file['path'], 300)}"
+        size += len(item.encode())
+        if size > 6_000:
+            body += "\n- See the JSON report for more files."
+            break
+        body += item
+    return body + "\n\n</details>"
+
+
+def earlier_open_findings(report):
+    current = {finding.get("id") for finding in report["findings"]}
+    return [
+        item["snapshot"] for item in report.get("history", [])
+        if item["status"] == "open" and item["id"] not in current and item.get("snapshot")
+    ]
+
+
 def summary(report, status, run_url):
     coverage = report["coverage"]
+    details = ""
+    findings = f"{len(report['findings'])} findings"
     if report["schema_version"] == "mortis.review/v1":
         done, selected = len(coverage["completed"]), len(coverage["selected"])
         label, revision = "review", report["head_sha"]
+        reused = coverage.get("reused", [])
+        if report.get("comparison"):
+            details = file_list("Files reviewed", coverage["completed"]) + file_list("Files reused", reused)
+        done += len(reused)
+        if earlier := earlier_open_findings(report):
+            findings += f" · {len(earlier)} earlier open"
     else:
         done, selected = coverage["completed_files"], coverage["selected_files"]
         label, revision = "security scan", report["commit"]
     return (
         f"## Mortis {label}\n\n"
         f"**{status.capitalize()}** · Commit {revision[:12]} · {done}/{selected} files covered"
-        f" · {len(report['findings'])} findings · [Workflow run]({run_url})"
+        f" · {findings} · [Workflow run]({run_url})"
+        + details
     )
