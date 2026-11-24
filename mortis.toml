@@ -1,7 +1,7 @@
 [review]
 auto_resolve = true
 review_sensitivity = "broad"
-effort = "medium"
+effort = "high"
 max_files = 100
 concurrency = 4
 timeout_seconds = 0
