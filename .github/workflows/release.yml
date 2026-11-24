@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: Validate release tag
+    if: github.event.created && !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tag points to a commit on main
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PUSHED_SHA: ${{ github.sha }}
+        run: |
+          commit=$(git rev-parse --verify --end-of-options "refs/tags/$RELEASE_TAG^{commit}")
+          test "$commit" = "$(git rev-parse --verify --end-of-options "$PUSHED_SHA^{commit}")"
+          git merge-base --is-ancestor "$commit" HEAD
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Test release commit
+    needs: guard
+    uses: ./.github/workflows/ci.yml
+
+  draft:
+    name: Draft GitHub release
+    needs: [guard, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ needs.guard.outputs.commit }}
+    steps:
+      - name: Draft release with generated notes
+        run: |
+          test "$(gh api "repos/$GH_REPO/commits/tags/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+          release_url=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .html_url")
+          if [[ -z "$release_url" ]]; then
+            release_url=$(gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes)
+          fi
+          printf '[Open the GitHub release for `%s`](%s)\n' "$RELEASE_TAG" "$release_url" >> "$GITHUB_STEP_SUMMARY"

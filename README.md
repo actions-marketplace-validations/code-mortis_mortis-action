@@ -125,6 +125,10 @@ The Actions summary shows status and coverage. The action exposes `status` (`com
 
 Use Python 3.15 and follow the [contribution guide](CONTRIBUTING.md) to install test dependencies and run the offline suite.
 
+### Releasing the action
+
+Push a new `vMAJOR.MINOR.PATCH` tag from `main`. The release workflow runs CI on that commit and creates a GitHub release draft with generated notes. Open the draft, select **Publish this Action to the GitHub Marketplace**, and publish the release.
+
 ## Security
 
 Report vulnerabilities privately using the [security policy](SECURITY.md).
