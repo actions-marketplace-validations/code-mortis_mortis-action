@@ -6,7 +6,7 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 
-from mortis_action import github, review
+from mortis_action import github, markdown, review
 from tests.helpers import review_report
 
 
@@ -223,3 +223,30 @@ class PublicationTests(unittest.TestCase):
         self.assertTrue(review.publish(self.api, self.report, "Coverage summary"))
         self.assertIn("Inline defect", self.comments[0]["body"])
         self.assertEqual(self.inline, [])
+
+    def test_incremental_summary_lists_files_and_keeps_earlier_open_findings(self):
+        self.report.update(status="completed", comparison={"strategy": "incremental"}, coverage={
+            "completed": [{"path": "app.py"}], "reused": [{"path": "@user<old>.py"}],
+            "selected": [{"path": "app.py"}, {"path": "@user<old>.py"}],
+        })
+        current = {**self.report["findings"][0], "id": "finding-" + "1" * 32}
+        prior = {**self.report["findings"][1], "id": "finding-" + "2" * 32}
+        self.report["findings"] = [current]
+        self.report["history"] = [
+            {"id": current["id"], "status": "open", "snapshot": current},
+            {"id": prior["id"], "status": "open", "snapshot": prior},
+            {"id": "finding-" + "3" * 32, "status": "resolved",
+             "snapshot": {**prior, "content": "Resolved defect"}},
+        ]
+        heading = markdown.summary(self.report, "completed", "https://github.com/owner/repo/actions/runs/123")
+        self.assertIn("2/2 files covered", heading)
+        self.assertIn("Files reviewed (1)", heading)
+        self.assertIn("Files reused (1)", heading)
+        self.assertIn("&#64;user&#60;old&#62;&#46;py", heading)
+        self.assertTrue(review.publish(self.api, self.report, heading))
+        body = self.comments[0]["body"]
+        self.assertEqual(body.count("Inline defect"), 1)
+        self.assertIn("### Earlier open findings", body)
+        self.assertIn("Summary-only defect", body)
+        self.assertNotIn("Resolved defect", body)
+        self.assertEqual(len(self.inline), 1)

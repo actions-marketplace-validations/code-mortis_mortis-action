@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       pull-requests: write
     concurrency:
@@ -29,6 +30,7 @@ jobs:
           review-forks: ${{ vars.MORTIS_REVIEW_FORKS }}
         env:
           MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
+          MORTIS_STATE_KEY: ${{ secrets.MORTIS_STATE_KEY }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() && vars.MORTIS_UPLOAD_REPORTS == 'true' && steps.mortis.outputs.report-json != '' }}
         with:
