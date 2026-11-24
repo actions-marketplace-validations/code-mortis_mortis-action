@@ -252,6 +252,116 @@ class ActionTests(unittest.TestCase):
             self.assertEqual(engine.call_args.args[:4], (args, repo, base, pr))
             self.assertTrue(engine.call_args.kwargs["manual"])
 
+    def test_ask_routes_from_the_conversation_and_reuses_the_engine_connection(self):
+        base, head = "a" * 40, "b" * 40
+        pr = pr_event(base, head, fork=True)["pull_request"]
+        event = comment_event("/mortis ask Why did this change?")
+        event["comment"]["id"] = 23
+        event_path = self.directory / "event.json"
+        event_path.write_text(json.dumps(event))
+        engine_calls, comments = [], []
+        settings = {"review": {"settings": {"model": "configured-model", "include_bot_prs": False}}}
+        answer = {
+            "schema_version": "mortis.ask/v1", "status": "completed", "base_sha": base, "head_sha": head,
+            "result": {"answer": "The behavior changed.",
+                       "citations": [{"path": "a (b).py", "sha": head, "start_line": 4, "end_line": 5}]},
+        }
+
+        def process(argv, **kwargs):
+            if Path(argv[0]).name == "mortis":
+                engine_calls.append(argv)
+                if argv[1] == "config":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(settings), "")
+                if argv[1] == "ask" and "--format" in argv:
+                    self.assertEqual(Path(argv[argv.index("--question-file") + 1]).read_text(), "Why did this change?")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(answer), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        def request(method, path, data=None, **kwargs):
+            if path.endswith("/permission"):
+                return {"permission": "write"}
+            if method == "GET":
+                return pr
+            self.assertEqual((method, path), ("POST", "/issues/42/comments"))
+            comments.append({"user": {"login": action.BOT}, **data})
+
+        with (
+            patch.dict(os.environ, {"RUNNER_OS": "Linux", "RUNNER_TEMP": str(self.directory),
+                                    "MORTIS_COMMAND": "review", "GITHUB_EVENT_NAME": "issue_comment",
+                                    "GITHUB_EVENT_PATH": str(event_path)}),
+            patch.object(action.GitHubAPI, "request", side_effect=request),
+            patch.object(action.GitHubAPI, "pages", side_effect=lambda path: [{"user": None, "body": ""}, *comments]),
+            patch.object(action, "fetch_pull_request", return_value=(["review", "--base", base, "--head", head], base)),
+            patch.object(action.subprocess, "run", side_effect=process),
+            patch("builtins.print"),
+        ):
+            action.main()
+            action.main()
+        self.assertIn("status=completed", self.outputs.read_text())
+        self.assertIn("status=skipped", self.outputs.read_text())
+        self.assertEqual(len(comments), 1)
+        self.assertIn("#issuecomment-23", comments[0]["body"])
+        self.assertIn(f"{head}/a%20%28b%29.py#L4-L5", comments[0]["body"])
+        connect = next(call for call in engine_calls if call[1] == "connect")
+        self.assertEqual(connect[connect.index("--model") + 1], "configured-model")
+        self.assertEqual(sum("--format" in call for call in engine_calls), 1)
+
+    def test_inline_and_linked_ask_use_the_same_current_diff_anchor(self):
+        api = action.GitHubAPI("owner/repo", 42)
+        anchor = {"pull_request_url": "https://api.github.com/repos/owner/repo/pulls/42",
+                  "path": "src/main.py", "line": 7, "start_line": 5, "side": "LEFT", "start_side": "LEFT"}
+        inline = {"comment": {"id": 4, "in_reply_to_id": 3}, "question": "Why remove this?", "inline": True}
+        linked = {"comment": {"id": 5}, "inline": False,
+                  "question": "Why remove this?\nhttps://github.com/owner/repo/pull/42/files#discussion_r3"}
+        with patch.object(api, "request", return_value=anchor) as request:
+            for command in (inline, linked):
+                args, reason = action.ask_arguments(api, command, self.directory)
+                self.assertIsNone(reason)
+                self.assertEqual(args[2:], ["--path=src/main.py", "--line", "5:7", "--side", "left"])
+                self.assertEqual(Path(args[1]).read_text(), "Why remove this?")
+            self.assertEqual(request.call_args.args, ("GET", "/pulls/comments/3"))
+            request.return_value = {**anchor, "line": None}
+            self.assertIsNone(action.ask_arguments(api, inline, self.directory)[0])
+            request.reset_mock()
+            wrong_pr = {**linked, "question": linked["question"].replace("/42/", "/41/")}
+            self.assertIsNone(action.ask_arguments(api, wrong_pr, self.directory)[0])
+            request.assert_not_called()
+
+            action.publish_answer(api, inline, {"status": "insufficient_context", "message": "Outdated anchor."})
+            self.assertEqual(request.call_args.args[:2], ("POST", "/pulls/42/comments/3/replies"))
+            self.assertIn("#discussion_r4", request.call_args.args[2]["body"])
+
+    def test_inline_forks_are_skipped_before_api_access(self):
+        event = {**pr_event(fork=True), "action": "created", "comment": comment_event("/mortis ask Why?")["comment"]}
+        with patch.object(action.GitHubAPI, "request") as request:
+            pr, reason = action.remote_pull_request("pull_request_review_comment", event)
+        self.assertIsNone(pr)
+        self.assertIn("from the conversation", reason)
+        request.assert_not_called()
+
+    def test_describe_preserves_author_content_and_checks_for_concurrent_edits(self):
+        api = action.GitHubAPI("owner/repo", 42)
+        base, head = "a" * 40, "b" * 40
+        pr = {**pr_event(base, head)["pull_request"], "title": "Old title", "body": "Author notes\n\n- [ ] Run tests"}
+        report = {"status": "completed", "base_sha": base, "head_sha": head,
+                  "result": {"title": "Increase the default", "narrative": "Changes the default.", "groups": []}}
+        self.assertEqual(action.comment_command("issue_comment", comment_event("/mortis describe")), ("describe", None))
+        with patch.object(api, "request") as request, patch.object(api, "current", return_value=pr) as current:
+            self.assertEqual(action.finish_pr_command(api, pr, {}, "describe", report)[1], "completed")
+            method, path, values = request.call_args.args
+            self.assertEqual((method, path, values["title"]), ("PATCH", "/pulls/42", "Increase the default"))
+            self.assertTrue(values["body"].startswith(pr["body"] + "\n\n"))
+            updated = action.description_body(values["body"] + "\nAuthor footer", report)
+            self.assertEqual(updated.count(action.DESCRIPTION_START), 1)
+            self.assertTrue(updated.endswith("\nAuthor footer"))
+            request.reset_mock()
+            current.return_value = {**pr, "body": "New author notes"}
+            self.assertEqual(action.finish_pr_command(api, pr, {}, "describe", report)[1], "skipped")
+            request.assert_not_called()
+            current.return_value = None
+            self.assertEqual(action.finish_pr_command(api, pr, {}, "describe", report)[1], "skipped")
+            request.assert_not_called()
+
     def run_mock(self, command, settings, pr=None, *, invalid=False, manual=False, threads=None):
         calls = []
         report = (
@@ -381,7 +491,7 @@ class ActionTests(unittest.TestCase):
             "GITHUB_WORKSPACE": str(self.directory),
             "MORTIS_COMMAND": "scan",
         }
-        def engine(args, repo, revision, pr, reports, directory, *, manual):
+        def engine(args, repo, revision, pr, reports, directory, *, manual, request):
             for name, filename in (("report-json", "report.json"), ("report-markdown", "report.md")):
                 path = reports / filename
                 path.write_text("Partial report")

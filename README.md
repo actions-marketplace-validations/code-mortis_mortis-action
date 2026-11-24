@@ -10,6 +10,22 @@ Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons
 
 Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. Drafts and Dependabot PRs are skipped. Other bot-authored PRs require `include_bot_prs = true`.
 
+### Ask or describe
+
+With an Engine release that provides `ask` and `describe`, users with repository write access can post these commands on an open PR:
+
+- `/mortis ask Why does this change the default?` answers from the current diff with links to the source lines. In a same-repository PR, post the command on a line in **Files changed** to receive a reply in that thread. For a fork PR, put the question in **Conversation** and paste the URL of a review comment on the selected lines on the last line.
+- `/mortis describe` updates the title and the Mortis summary block in the description. The rest of the description is preserved.
+
+When updating the workflow to the Action commit and Engine release that support these commands, enable inline questions by adding this event under `on`:
+
+```yaml
+  pull_request_review_comment:
+    types: [created]
+```
+
+The existing `contents: read` and `pull-requests: write` permissions are sufficient. Both commands use the review model and provider already configured for the workflow.
+
 - Set the `MORTIS_REVIEW_FORKS` repository variable to `true` to enable automatic fork reviews. Fork activity can then trigger provider calls.
 - Set `MORTIS_UPLOAD_REPORTS` to `true` to retain JSON and Markdown as workflow artifacts for seven days. Reports can include source evidence.
 
