@@ -66,7 +66,7 @@ jobs:
         with:
           provider: opencode-go
           protocol: openai-responses
-          base-url: https://opencode.ai/inference/go/openai/v1
+          base-url: https://opencode.ai/zen/go/v1
           model: ${{ vars.MORTIS_MODEL }}
           review-forks: ${{ vars.MORTIS_REVIEW_FORKS }}
         env:
