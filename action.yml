@@ -1,4 +1,4 @@
-name: Mortis
+name: Mortis Review and Scan
 description: Review Git changes and scan a repository with Mortis Engine
 inputs:
   command:
