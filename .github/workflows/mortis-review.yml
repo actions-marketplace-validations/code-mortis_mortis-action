@@ -8,63 +8,26 @@ on:
 permissions: {}
 
 jobs:
-  authorize-comment:
-    if: >-
-      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-      github.event.issue.state == 'open' && github.event.comment.user.type == 'User' &&
-      github.event.comment.body == '/mortis review'
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: read
-    outputs:
-      pr-number: ${{ steps.authorize.outputs.pr-number }}
-    steps:
-      - id: authorize
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
-        with:
-          script: |
-            const { comment, issue } = context.payload;
-            if (comment.body !== '/mortis review') return;
-            let access;
-            try {
-              ({ data: access } = await github.rest.repos.getCollaboratorPermissionLevel({
-                ...context.repo, username: comment.user.login,
-              }));
-            } catch (error) {
-              if (error.status === 404) return;
-              throw error;
-            }
-            if (!['admin', 'write', 'maintain'].includes(access.permission)) return;
-            const { data: pr } = await github.rest.pulls.get({
-              ...context.repo, pull_number: issue.number,
-            });
-            if (pr.state === 'open' && !pr.draft && pr.user.login !== 'dependabot[bot]') {
-              core.setOutput('pr-number', pr.number);
-            }
-
   review:
-    needs: authorize-comment
     if: >-
-      ${{ !cancelled() && (
-        needs.authorize-comment.outputs.pr-number != '' || (
-          github.event_name == 'pull_request_target' && !github.event.pull_request.draft &&
-          github.event.pull_request.user.login != 'dependabot[bot]' && github.event.sender.login != 'dependabot[bot]' &&
-          (github.event.pull_request.head.repo.full_name == github.repository || vars.MORTIS_REVIEW_FORKS == 'true')
-        )
-      ) }}
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request && github.event.issue.state == 'open' &&
+       github.event.comment.user.type == 'User' && github.event.comment.body == '/mortis review')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
     concurrency:
-      group: mortis-review-${{ github.event.pull_request.number || needs.authorize-comment.outputs.pr-number || format('skip-{0}', github.run_id) }}
-      cancel-in-progress: true
+      group: mortis-review-${{ github.event.pull_request.number || github.event.issue.number }}
+      queue: max
     steps:
-      - uses: code-mortis/mortis-action@5a5459317154884de8a58c68d626ad34a59e747c
+      - uses: code-mortis/mortis-action@98356b87ec8cf6abe4de8d9e314ff9014ee0daa9
         id: mortis
         with:
-          provider: openai
+          provider: opencode-go
+          protocol: openai-responses
+          base-url: https://opencode.ai/zen/go/v1
           model: ${{ vars.MORTIS_MODEL }}
           review-forks: ${{ vars.MORTIS_REVIEW_FORKS }}
         env:
