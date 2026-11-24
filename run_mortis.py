@@ -525,23 +525,38 @@ def publish_answer(api, request, report):
     anchor = "discussion_r" if inline else "issuecomment-"
     url = f"{pull_request_url(api)}#{anchor}{int(comment['id'])}"
     body = f"{ask_marker(request)}\n### Mortis answer\n\n[Question]({url})\n\n"
+    links = []
     if report["status"] == "insufficient_context":
-        body += safe_text(report["message"], 1000)
+        answer = safe_text(report["message"], 1000)
     else:
         result = report["result"]
-        body += "\n\n".join(safe_text(paragraph, 6000) for paragraph in result["answer"].split("\n\n"))
+        answer = "\n\n".join(safe_text(paragraph, 6000) for paragraph in result["answer"].split("\n\n"))
         server = os.environ["GITHUB_SERVER_URL"].rstrip("/")
-        if result["citations"]:
-            body += "\n\n**Sources**"
         for citation in result["citations"]:
             path, sha = citation["path"], citation["sha"]
             first, last = citation["start_line"], citation["end_line"]
             line = f"L{first}" if first == last else f"L{first}-L{last}"
             link = f"{server}/{api.owner}/{api.name}/blob/{sha}/{quote(path, safe='/')}#{line}"
-            body += f"\n- [{safe_text(path, 300)} · {line}]({link})"
+            links.append(f"\n- [{safe_text(path, 300)} · {line}]({link})")
+    heading = "\n\n**Sources**"
+    sources = heading + "".join(links) if links else ""
+    footer = ""
     if report.get("limited_context"):
-        body += "\n\nThe answer uses the diff that fit within the configured context limit."
-    api.request("POST", destination, {"body": body})
+        footer = "\n\nThe answer uses the diff that fit within the configured context limit."
+    if len((body + answer + sources + footer).encode()) > COMMENT_BODY_LIMIT:
+        footer += "\n\nSome text or sources were omitted to fit GitHub's comment limit."
+        available = COMMENT_BODY_LIMIT - len((body + footer).encode())
+        encoded = answer.encode()
+        # When sources alone are large, keep room for the answer.
+        source_limit = available - min(len(encoded), available // 2)
+        sources = ""
+        for link in links:
+            candidate = (sources or heading) + link
+            if len(candidate.encode()) <= source_limit:
+                sources = candidate
+        answer = encoded[:available - len(sources.encode())].decode("utf-8", errors="ignore")
+        answer = re.sub(r"&(?:#\d*)?$", "", answer).rstrip()
+    api.request("POST", destination, {"body": body + answer + sources + footer})
 
 
 def description_body(original, report):

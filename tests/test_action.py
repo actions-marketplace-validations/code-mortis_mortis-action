@@ -331,6 +331,26 @@ class ActionTests(unittest.TestCase):
             self.assertEqual(request.call_args.args[:2], ("POST", "/pulls/42/comments/3/replies"))
             self.assertIn("#discussion_r4", request.call_args.args[2]["body"])
 
+    def test_ask_caps_rendered_comment_bytes_and_preserves_complete_citations(self):
+        api = action.GitHubAPI("owner/repo", 42)
+        path = "🚀" * 60 + ".py"
+        sha = "b" * 40
+        citations = [{"path": path, "sha": sha, "start_line": line, "end_line": line} for line in range(1, 13)]
+        report = {"status": "completed", "limited_context": True,
+                  "result": {"answer": "界" + "😀" * 5999, "citations": citations}}
+        command = {"comment": {"id": 23}, "inline": False}
+        with patch.object(api, "request") as request:
+            action.publish_answer(api, command, report)
+        body = request.call_args.args[2]["body"]
+        self.assertLessEqual(len(body.encode()), action.COMMENT_BODY_LIMIT)
+        self.assertIn("#issuecomment-23", body)
+        self.assertIn("界", body)
+        self.assertNotRegex(body.split("\n\n**Sources**")[0], r"&#\d*$")
+        for line in range(1, 13):
+            self.assertIn(f"/blob/{sha}/" + "%F0%9F%9A%80" * 60 + f".py#L{line})", body)
+        self.assertIn("configured context limit", body)
+        self.assertIn("omitted to fit GitHub's comment limit", body)
+
     def test_inline_forks_are_skipped_before_api_access(self):
         event = {**pr_event(fork=True), "action": "created", "comment": comment_event("/mortis ask Why?")["comment"]}
         with patch.object(action.GitHubAPI, "request") as request:
