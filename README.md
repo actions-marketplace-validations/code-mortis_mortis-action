@@ -123,4 +123,12 @@ The Actions summary shows status and coverage. The action exposes `status` (`com
 
 ## Development
 
-Install `mortis-engine==0.1.3` and `PyYAML==6.0.3`, then run `python -B -m unittest discover -s tests`. Tests exercise local Git fixtures and mock the provider and GitHub boundaries.
+Use Python 3.13 and follow the [contribution guide](CONTRIBUTING.md) to install test dependencies and run the offline suite.
+
+## Security
+
+Report vulnerabilities privately using the [security policy](SECURITY.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
