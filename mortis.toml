@@ -1,0 +1,10 @@
+[review]
+review_sensitivity = "high"
+effort = "medium"
+max_files = 100
+concurrency = 4
+timeout_seconds = 0
+token_budget = 1000000
+assessment_token_budget = 1000000
+summary_token_budget = 500000
+max_output_tokens = 0
