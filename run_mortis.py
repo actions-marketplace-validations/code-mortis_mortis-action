@@ -503,7 +503,7 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
         install_trivy(directory, environment)
         environment["PATH"] = str(directory) + os.pathsep + environment["PATH"]
     environment["MORTIS_API_KEY"] = key
-    connection = mortis(
+    connection_args = [
         "connect",
         "ci",
         "--provider",
@@ -513,7 +513,11 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
         "--api-key-env",
         "MORTIS_API_KEY",
         "--non-interactive",
-    )
+    ]
+    for name, flag in (("MORTIS_PROTOCOL", "--protocol"), ("MORTIS_BASE_URL", "--base-url")):
+        if override := os.environ.get(name, "").strip():
+            connection_args.extend([flag, override])
+    connection = mortis(*connection_args)
     if connection.returncode:
         raise ValueError("Provider connection failed. " + connection.stderr.strip())
     report_json = reports / "report.json"

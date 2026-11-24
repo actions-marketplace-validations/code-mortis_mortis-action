@@ -174,6 +174,8 @@ class ActionTests(unittest.TestCase):
                     "GITHUB_STEP_SUMMARY": str(self.directory / "summary"),
                     "MORTIS_API_KEY": "test-provider-key",
                     "MORTIS_PROVIDER": "openai",
+                    "MORTIS_PROTOCOL": "",
+                    "MORTIS_BASE_URL": "",
                     "MORTIS_MODEL": "fallback",
                     "MORTIS_GITHUB_TOKEN": "test-github-token",
                     "GITHUB_SERVER_URL": "https://github.com",
@@ -328,7 +330,24 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(result[:2], (2, "partial"))
         connect = next(call for call in calls if "connect" in call)
         self.assertEqual(connect[connect.index("--model") + 1], "fallback")
+        self.assertNotIn("--protocol", connect)
+        self.assertNotIn("--base-url", connect)
         trivy.assert_not_called()
+
+    def test_review_passes_connection_overrides_to_engine(self):
+        endpoint = "https://opencode.ai/inference/go/openai/v1"
+        with patch.dict(os.environ, {
+            "MORTIS_PROVIDER": "opencode-go",
+            "MORTIS_PROTOCOL": "openai-responses",
+            "MORTIS_BASE_URL": endpoint,
+        }):
+            result, calls, _ = self.run_mock("review", {"model": ""})
+        self.assertEqual(result[:2], (2, "partial"))
+        connect = next(call for call in calls if "connect" in call)
+        self.assertEqual(connect[connect.index("--provider") + 1], "opencode-go")
+        self.assertEqual(connect[connect.index("--protocol") + 1], "openai-responses")
+        self.assertEqual(connect[connect.index("--base-url") + 1], endpoint)
+        self.assertEqual(connect[connect.index("--model") + 1], "fallback")
 
     def test_entrypoint_records_partial_result_before_shell_propagates_exit_code(self):
         event = self.directory / "event.json"
