@@ -17,6 +17,8 @@ The workflow uses `pull_request_target` and `issue_comment`. The action fetches 
 
 When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. For workflow files, Mortis also checks that the resulting YAML parses and has unique mapping keys. Use **Commit suggestion** to apply the replacement to the PR branch.
 
+With an Engine release that supports `review --prior-findings`, set `auto_resolve = true` under `[review]` in the target branch's `mortis.toml` to verify earlier inline findings on the next review. Mortis reuses its open threads and resolves one only after the Engine verifies the fix against the current PR head. Threads posted before finding IDs were recorded, or whose original commit is unavailable, stay open. The 0.1.3 package pinned here predates this integration.
+
 Existing `pull_request` workflows can continue reviewing same-repository PRs with their full checkout.
 
 ## Compare branches
