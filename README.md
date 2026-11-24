@@ -1,23 +1,23 @@
 # Mortis Action
 
-Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. The action installs Mortis Engine 0.1.3 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
+Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. The action installs Mortis Engine 0.1.5 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
 
 ## Review pull requests
 
 1. Copy [the review workflow](.github/workflows/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
-2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.3/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
+2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.5/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
 3. Pin the action to a reviewed commit SHA. The workflow includes the SHA used by this repository.
 
 Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. Drafts and Dependabot PRs are skipped. Other bot-authored PRs require `include_bot_prs = true`.
 
 ### Ask or describe
 
-With an Engine release that provides `ask` and `describe`, users with repository write access can post these commands on an open PR:
+With an action commit that installs Mortis Engine 0.1.5 or later, users with repository write access can post these commands on an open PR:
 
 - `/mortis ask Why does this change the default?` answers from the current diff with links to the source lines. In a same-repository PR, post the command on a line in **Files changed** to receive a reply in that thread. For a fork PR, put the question in **Conversation** and paste the URL of a review comment on the selected lines on the last line.
 - `/mortis describe` updates the title and the Mortis summary block in the description. The rest of the description is preserved.
 
-When updating the workflow to the Action commit and Engine release that support these commands, enable inline questions by adding this event under `on`:
+To enable inline questions, add this event under `on`:
 
 ```yaml
   pull_request_review_comment:
@@ -33,7 +33,7 @@ The workflow uses `pull_request_target` and `issue_comment`. The action fetches 
 
 When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. For workflow files, Mortis also checks that the resulting YAML parses and has unique mapping keys. Use **Commit suggestion** to apply the replacement to the PR branch.
 
-With an Engine release that supports `review --prior-findings`, set `auto_resolve = true` under `[review]` in the target branch's `mortis.toml` to verify earlier inline findings on the next review. Mortis reuses its open threads and resolves one only after the Engine verifies the fix against the current PR head. Threads posted before finding IDs were recorded, or whose original commit is unavailable, stay open. The 0.1.3 package pinned here predates this integration.
+GitHub thread resolution requires a future Engine release with `review --prior-findings`. With that release, set `auto_resolve = true` under `[review]` in the target branch's `mortis.toml` to verify earlier inline findings on the next review. Mortis reuses its open threads and resolves one only after the Engine verifies the fix against the current PR head. Threads posted before finding IDs were recorded, or whose original commit is unavailable, stay open.
 
 Existing `pull_request` workflows can continue reviewing same-repository PRs with their full checkout.
 

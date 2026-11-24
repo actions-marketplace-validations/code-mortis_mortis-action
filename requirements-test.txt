@@ -1,3 +1,3 @@
 # Keep these pins aligned with the runtime dependencies in run_mortis.py.
-mortis-engine==0.1.3
+mortis-engine==0.1.5
 PyYAML==6.0.3
