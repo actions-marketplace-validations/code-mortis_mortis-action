@@ -269,6 +269,13 @@ def safe_text(value, limit):
     return re.sub(r"[^\w ,:;!?'/\-]|_", lambda char: f"&#{ord(char[0])};", text)
 
 
+def redact_credentials(message):
+    secrets = (os.environ.get("MORTIS_API_KEY", ""), os.environ.get("MORTIS_GITHUB_TOKEN", ""))
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        message = message.replace(secret, "[redacted]")
+    return message
+
+
 def finding_text(finding):
     location = f"{finding['path']}:{finding['start_line']}"
     return (
@@ -864,6 +871,15 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                 heading += "\n\nThe PR changed during the run. Results apply to the recorded commit."
         except (ValueError, OSError, http.client.HTTPException) as error:
             return result.returncode or 1, "failed", f"{heading}\n\nPR publication failed. {error}"
+    if status in {"failed", "partial"}:
+        diagnostics = [
+            *report.get("problems", []),
+            *(f"{row['path']}: {row['message']}" for row in report.get("errors", [])),
+            *(f"{row['stage']}: {row['error']}" for row in report.get("stage_errors", [])),
+            *(row["reason"] for row in report["coverage"].get("waived", [])),
+        ]
+        if diagnostics:
+            heading += "\n\n" + safe_text(redact_credentials(" ".join(dict.fromkeys(diagnostics))), 1400)
     return result.returncode, status, heading
 
 
@@ -911,12 +927,17 @@ def main():
         )
     except (KeyError, OSError, ValueError, http.client.HTTPException, tarfile.TarError) as error:
         code, status, message = 1, "failed", str(error)
-    if key := os.environ.get("MORTIS_API_KEY"):
-        message = message.replace(key, "[redacted]")
+    message = redact_credentials(message)
+    if status in {"failed", "partial"}:
+        level = "error" if status == "failed" else "warning"
+        diagnostic = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)[:2000]
+        diagnostic = diagnostic.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::{level}::{diagnostic}")
+    else:
+        print(f"Mortis action {status}. See the job summary for details.")
     if not message.startswith("## Mortis "):
         message = f"## Mortis {status}\n\n{safe_text(message, 2000)}"
     append("GITHUB_STEP_SUMMARY", message)
-    print(f"Mortis action {status}. See the job summary for details.")
     output("status", status)
     output("exit-code", code)
 

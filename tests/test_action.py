@@ -394,6 +394,7 @@ class ActionTests(unittest.TestCase):
                 "commit": "a" * 40,
                 "coverage": {"completed_files": 1, "selected_files": 3},
                 "findings": [],
+                "problems": ["Dependency inventory timed out. Token test.token"],
             }
         )
 
@@ -466,9 +467,12 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(result[:2], (2, "partial"))
 
     def test_partial_scan_preserves_outputs_and_uses_configured_model(self):
-        result, calls, trivy = self.run_mock("scan", {"model": "committed-model"})
+        with patch.dict(os.environ, {"MORTIS_GITHUB_TOKEN": "test.token"}):
+            result, calls, trivy = self.run_mock("scan", {"model": "committed-model"})
         self.assertEqual(result[:2], (2, "partial"))
         self.assertIn("1/3 files covered", result[2])
+        self.assertIn("Dependency inventory timed out", result[2])
+        self.assertNotIn("test&#46;token", result[2])
         trivy.assert_called_once()
         connect = next(call for call in calls if "connect" in call)
         self.assertEqual(connect[connect.index("--model") + 1], "committed-model")
@@ -523,15 +527,41 @@ class ActionTests(unittest.TestCase):
             patch.dict(os.environ, environment),
             patch.object(action, "select_run", return_value=(["scan", "--ref", "base"], "base")),
             patch.object(action, "run_engine", side_effect=engine) as run,
-            patch("builtins.print"),
+            patch("builtins.print") as log,
         ):
             action.main()
+        log.assert_called_once_with("::warning::## Mortis security scan")
         self.assertIn("status=partial\nexit-code=2\n", self.outputs.read_text())
         self.assertIn("Mortis security scan", Path(os.environ["GITHUB_STEP_SUMMARY"]).read_text())
         outputs = dict(line.split("=", 1) for line in self.outputs.read_text().splitlines())
         for name in ("report-json", "report-markdown"):
             self.assertEqual(Path(outputs[name]).read_text(), "Partial report")
         self.assertFalse(run.call_args.args[-1].exists())
+
+    def test_entrypoint_logs_the_failure_without_secrets_or_extra_workflow_commands(self):
+        base = "a" * 40
+        event = self.directory / "event.json"
+        event.write_text("{}")
+        environment = {
+            "RUNNER_OS": "Linux",
+            "RUNNER_TEMP": str(self.directory),
+            "GITHUB_EVENT_NAME": "schedule",
+            "GITHUB_EVENT_PATH": str(event),
+            "GITHUB_WORKSPACE": str(self.directory),
+            "MORTIS_COMMAND": "scan",
+        }
+        failure = ValueError("Provider rejected test-provider-key at 50%\r\n::notice::test-github-token")
+        with (
+            patch.dict(os.environ, environment),
+            patch.object(action, "select_run", return_value=(["scan", "--ref", base], base)),
+            patch.object(action, "run_engine", side_effect=failure),
+            patch("builtins.print") as log,
+        ):
+            action.main()
+        log.assert_called_once_with(
+            "::error::Provider rejected [redacted] at 50%25%0D%0A::notice::[redacted]"
+        )
+        self.assertIn("status=failed\nexit-code=1\n", self.outputs.read_text())
 
 
 class PublicationTests(unittest.TestCase):
