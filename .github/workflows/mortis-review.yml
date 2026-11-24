@@ -61,10 +61,12 @@ jobs:
       group: mortis-review-${{ github.event.pull_request.number || needs.authorize-comment.outputs.pr-number || format('skip-{0}', github.run_id) }}
       cancel-in-progress: true
     steps:
-      - uses: code-mortis/mortis-action@5a5459317154884de8a58c68d626ad34a59e747c
+      - uses: code-mortis/mortis-action@98356b87ec8cf6abe4de8d9e314ff9014ee0daa9
         id: mortis
         with:
-          provider: openai
+          provider: opencode-go
+          protocol: openai-responses
+          base-url: https://opencode.ai/inference/go/openai/v1
           model: ${{ vars.MORTIS_MODEL }}
           review-forks: ${{ vars.MORTIS_REVIEW_FORKS }}
         env:
