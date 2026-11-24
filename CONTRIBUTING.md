@@ -1,10 +1,10 @@
 # Contributing to Mortis Action
 
-Use Python 3.13 and Git. Create a virtual environment, install the test
+Use Python 3.15 and Git. Create a virtual environment, install the test
 dependencies, and run the offline test suite.
 
 ```sh
-python3.13 -m venv .venv
+python3.15 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements-test.txt
 python -B -m unittest discover -s tests

@@ -123,7 +123,7 @@ The Actions summary shows status and coverage. The action exposes `status` (`com
 
 ## Development
 
-Use Python 3.13 and follow the [contribution guide](CONTRIBUTING.md) to install test dependencies and run the offline suite.
+Use Python 3.15 and follow the [contribution guide](CONTRIBUTING.md) to install test dependencies and run the offline suite.
 
 ## Security
 
