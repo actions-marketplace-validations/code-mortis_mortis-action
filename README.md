@@ -15,7 +15,7 @@ Same-repository PRs are reviewed automatically. A user with repository write acc
 
 The workflow uses `pull_request_target` and `issue_comment`. The action fetches PR commits into a temporary bare Git repository and reads them as data. It compares the exact head to the merge base and loads `mortis.toml` from the **target commit**. Mortis updates one summary comment with the change overview, coverage, and confirmed findings. It also posts findings inline when GitHub can anchor them to added lines.
 
-When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. Use **Commit suggestion** to apply the replacement to the PR branch.
+When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. For workflow files, Mortis also checks that the resulting YAML parses and has unique mapping keys. Use **Commit suggestion** to apply the replacement to the PR branch.
 
 Existing `pull_request` workflows can continue reviewing same-repository PRs with their full checkout.
 
@@ -105,4 +105,4 @@ The Actions summary shows status and coverage. The action exposes `status` (`com
 
 ## Development
 
-Install `mortis-engine==0.1.3` and run `python -B -m unittest discover -s tests`. Tests exercise local Git fixtures and mock the provider and GitHub boundaries.
+Install `mortis-engine==0.1.3` and `PyYAML==6.0.3`, then run `python -B -m unittest discover -s tests`. Tests exercise local Git fixtures and mock the provider and GitHub boundaries.

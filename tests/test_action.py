@@ -465,6 +465,33 @@ class PublicationTests(unittest.TestCase):
         self.assertTrue(action.publish(self.api, self.report, "Review summary"))
         self.assertNotIn("```suggestion", self.inline[0]["body"])
 
+    def test_only_valid_workflow_suggestions_are_published(self):
+        self.filename = ".github/workflows/review.yml"
+        self.diff_patch = "@@ -1,5 +1,7 @@\n on: push\n \n jobs:\n+  review:\n+    runs-on: ubuntu-latest\n     steps:\n       - run: echo review"
+        source = b"on: push\n\njobs:\n  review:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo review\n"
+        self.assertEqual(self.report["findings"][0]["start_line"], 4)
+        for replacement, offer in (
+            ("jobs:\n  review:\n    runs-on: ubuntu-latest", False),
+            ("  review:\n    runs-on: [ubuntu-latest", False),
+            ("  review:\n    runs-on: ubuntu-latest\n    runs-on: ubuntu-24.04", False),
+            ("  review:\n    runs-on: ubuntu-24.04", True),
+        ):
+            with self.subTest(replacement=replacement):
+                self.inline.clear()
+                self.set_suggestion(
+                    path=self.filename,
+                    existing_code="  review:\n    runs-on: ubuntu-latest",
+                    suggestion_code=replacement,
+                )
+                with patch.object(action.subprocess, "check_output", return_value=source) as read:
+                    self.assertTrue(action.publish(
+                        self.api, self.report, "Review summary", repo="test-repo", workflow_python=sys.executable,
+                    ))
+                read.assert_called_once()
+                self.assertIn(f"{self.report['head_sha']}:{self.filename}", read.call_args.args[0])
+                self.assertEqual(len(self.inline), 1)
+                self.assertEqual("```suggestion" in self.inline[0]["body"], offer)
+
     def test_rejected_suggestion_falls_back_to_plain_finding(self):
         self.set_suggestion()
         self.reject_suggestions = True

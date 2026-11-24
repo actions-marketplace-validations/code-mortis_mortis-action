@@ -217,7 +217,29 @@ def suggested_change(finding, head, lines):
         row = lines.get(number)
         if row is None or row[:2] != (first[0], text):
             return None
-    return f"\n\n```suggestion\n{replacement}\n```"
+    return replacement
+
+
+def valid_workflow_replacement(repo, python, head, finding, replacement):
+    if repo is None or python is None:
+        return False
+    try:
+        source = subprocess.check_output(
+            ["git", "-C", repo, "cat-file", "blob", f"{head}:{finding['path']}"],
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8").replace("\r\n", "\n")
+        lines = source.split("\n")
+        start, end = finding["start_line"], finding["end_line"]
+        existing = finding["existing_code"].replace("\r\n", "\n").removesuffix("\n")
+        if "\n".join(lines[start - 1:end]) != existing:
+            return False
+        updated = "\n".join([*lines[:start - 1], replacement, *lines[end:]])
+        validator = Path(__file__).with_name("validate_workflow.py")
+        return subprocess.run(
+            [python, "-I", validator], input=updated, encoding="utf-8", capture_output=True,
+        ).returncode == 0
+    except (OSError, UnicodeError, subprocess.CalledProcessError):
+        return False
 
 
 def safe_text(value, limit):
@@ -329,7 +351,7 @@ def overview(report):
     return body
 
 
-def publish(api, report, heading):
+def publish(api, report, heading, *, repo=None, workflow_python=None):
     if not api.is_current(report):
         return False
     findings = report["findings"]
@@ -399,7 +421,13 @@ def publish(api, report, heading):
             "line": line,
             "side": "RIGHT",
         }
-        suggestion = suggested_change(finding, report["head_sha"], lines)
+        replacement = suggested_change(finding, report["head_sha"], lines)
+        workflow = Path(path).parent == Path(".github/workflows") and path.endswith((".yml", ".yaml"))
+        if replacement and workflow and not valid_workflow_replacement(
+            repo, workflow_python, report["head_sha"], finding, replacement,
+        ):
+            replacement = None
+        suggestion = f"\n\n```suggestion\n{replacement}\n```" if replacement else ""
         posted = None
         if suggestion and len((payload["body"] + suggestion).encode()) <= COMMENT_BODY_LIMIT:
             start, end = finding["start_line"], finding["end_line"]
@@ -428,6 +456,9 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
     )
     subprocess.run([sys.executable, "-I", "-m", "venv", directory / "venv"], check=True, env=environment)
     bin_dir = directory / "venv/bin"
+    packages = ["mortis-engine==0.1.3"]
+    if pr and args[0] == "review":
+        packages.append("PyYAML==6.0.3")
     subprocess.run(
         [
             bin_dir / "python",
@@ -440,7 +471,7 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
             "--no-input",
             "--index-url",
             "https://pypi.org/simple",
-            "mortis-engine==0.1.3",
+            *packages,
         ],
         check=True,
         env=environment,
@@ -502,7 +533,8 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
     heading = summary(report, status, url)
     if pr and command == "review":
         try:
-            if not publish(GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"]), report, heading):
+            api = GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"])
+            if not publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python"):
                 heading += "\n\nThe PR changed during the run. Results apply to the recorded commit."
         except (ValueError, OSError, http.client.HTTPException) as error:
             return result.returncode or 1, "failed", f"{heading}\n\nPR publication failed. {error}"
