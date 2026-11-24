@@ -56,7 +56,7 @@ jobs:
     steps:
       - name: Draft release with generated notes
         run: |
-          test "$(gh api "repos/$GH_REPO/commits/tags/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+          test "$(gh api "repos/$GH_REPO/commits/refs/tags/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
           release_url=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
             --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .html_url")
           if [[ -z "$release_url" ]]; then
