@@ -1,4 +1,4 @@
-"""Run the pinned Mortis CLI and publish its confirmed review findings."""
+"""Run the pinned Mortis CLI and publish its results on GitHub."""
 
 import base64
 import hashlib
@@ -19,7 +19,10 @@ BOT = "github-actions[bot]"
 COMMENT_BODY_LIMIT = 55_000
 FINDING_ID = re.compile(r"finding-[0-9a-f]{32}")
 FINDING_METADATA = "<!-- mortis-action:prior-finding:v1:"
-REMOTE_REVIEW_EVENTS = {"pull_request_target", "issue_comment"}
+DESCRIPTION_START = "<!-- mortis-action:description -->"
+DESCRIPTION_END = "<!-- /mortis-action:description -->"
+COMMENT_EVENTS = {"issue_comment", "pull_request_review_comment"}
+REMOTE_REVIEW_EVENTS = {"pull_request_target", *COMMENT_EVENTS}
 TRIVY_VERSION = "0.76.0"
 TRIVY_ASSETS = {
     "X64": ("64bit", "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7"),
@@ -82,23 +85,38 @@ def review_range(repo, base, head, *, env=None):
     return ["review", "--base", base, "--head", head], base
 
 
+def comment_command(event_name, event):
+    inline = event_name == "pull_request_review_comment"
+    comment = event.get("comment", {})
+    author = comment.get("user", {})
+    if event.get("action") != "created" or author.get("type") != "User":
+        return None
+    if not inline and not event.get("issue", {}).get("pull_request"):
+        return None
+    body = comment.get("body", "")
+    if not inline and body == "/mortis review":
+        return "review", None
+    if not inline and body.strip() == "/mortis describe":
+        return "describe", None
+    if match := re.fullmatch(r"/mortis ask\s+(\S.*)", body.strip(), re.DOTALL):
+        return "ask", match[1]
+    return None
+
+
 def remote_pull_request(event_name, event):
     repository = os.environ["GITHUB_REPOSITORY"]
-    manual = event_name == "issue_comment"
+    manual = event_name in COMMENT_EVENTS
+    inline = event_name == "pull_request_review_comment"
     if manual:
-        issue = event.get("issue", {})
-        comment = event.get("comment", {})
-        author = comment.get("user", {})
-        if (
-            event.get("action") != "created"
-            or not issue.get("pull_request")
-            or comment.get("body") != "/mortis review"
-            or author.get("type") != "User"
-        ):
-            return None, "No Mortis review command"
-        api = GitHubAPI(repository, issue["number"])
+        if not comment_command(event_name, event):
+            return None, "No Mortis PR command"
+        trigger = event["pull_request"] if inline else event["issue"]
+        if inline and (trigger["head"]["repo"] or {}).get("full_name") != repository:
+            return None, "Ask about fork PR lines from the conversation using a review comment link"
+        api = GitHubAPI(repository, trigger["number"])
+        author = event["comment"]["user"]
         if not api.can_review(author["login"]):
-            return None, "Mortis review commands require repository write access"
+            return None, "Mortis commands require repository write access"
     else:
         trigger = event["pull_request"]
         api = GitHubAPI(repository, trigger["number"])
@@ -110,6 +128,8 @@ def remote_pull_request(event_name, event):
         return None, "Draft or closed pull request"
     if "dependabot[bot]" in {pr["user"]["login"], event["sender"]["login"]}:
         return None, "Dependabot pull request"
+    if inline and (pr["head"]["repo"] or {}).get("full_name") != repository:
+        return None, "Ask about fork PR lines from the conversation using a review comment link"
     if not manual:
         head_repo = pr["head"]["repo"] or {}
         allow_forks = os.environ.get("MORTIS_REVIEW_FORKS", "false").lower() == "true"
@@ -408,14 +428,19 @@ class GitHubAPI:
                 return
             page += 1
 
-    def is_current(self, report):
+    def current(self, report):
         pr = self.request("GET", self.pull)
-        return (
+        if (
             pr["state"] == "open"
             and not pr["draft"]
             and pr["base"]["sha"] == report["base_sha"]
             and pr["head"]["sha"] == report["head_sha"]
-        )
+        ):
+            return pr
+        return None
+
+    def is_current(self, report):
+        return self.current(report) is not None
 
     def can_review(self, login):
         url = f"/collaborators/{quote(login, safe='')}/permission"
@@ -445,6 +470,129 @@ def overview(report):
             groups_text += item
         body += groups_text
     return body
+
+
+def pull_request_url(api):
+    return f"{os.environ['GITHUB_SERVER_URL'].rstrip('/')}/{api.owner}/{api.name}/pull/{api.number}"
+
+
+def ask_arguments(api, request, directory):
+    comment = request["comment"]
+    question = request["question"]
+    lines = question.splitlines()
+    link = lines[-1].strip()
+    target = (comment.get("in_reply_to_id") or comment["id"]) if request["inline"] else None
+    if not target and re.match(r"https?://\S+#discussion_r", link):
+        match = re.fullmatch(re.escape(pull_request_url(api)) + r"(?:/files)?(?:\?[^\s#]*)?#discussion_r([1-9]\d*)", link)
+        if not match:
+            return None, "Use a review comment link from this pull request."
+        target = int(match[1])
+        question = "\n".join(lines[:-1]).strip()
+    if not 0 < len(question) <= 8000:
+        return None, "Supply a question of 1–8000 characters."
+    arguments = []
+    if target:
+        anchor = api.request("GET", f"/pulls/comments/{int(target)}", allow_missing=True)
+        expected = os.environ["GITHUB_API_URL"].rstrip("/") + api.repo + api.pull
+        if not anchor or anchor.get("pull_request_url") != expected:
+            return None, "The linked review comment is unavailable on this pull request."
+        last, side = anchor.get("line"), anchor.get("side")
+        first = anchor.get("start_line") or last
+        if (
+            not anchor.get("path") or type(first) is not int or type(last) is not int
+            or not 1 <= first <= last or side not in {"LEFT", "RIGHT"}
+            or anchor.get("start_side") not in {None, side}
+        ):
+            return None, "The selected lines are unavailable on the current pull request diff."
+        arguments.extend([f"--path={anchor['path']}", "--line", f"{first}:{last}", "--side", side.lower()])
+    path = directory / "question.txt"
+    path.write_text(question, encoding="utf-8")
+    return ["--question-file", path, *arguments], None
+
+
+def ask_marker(request):
+    return f"<!-- mortis-action:ask:{int(request['comment']['id'])} -->"
+
+
+def publish_answer(api, request, report):
+    comment = request["comment"]
+    inline = request["inline"]
+    if inline:
+        root = int(comment.get("in_reply_to_id") or comment["id"])
+        destination = f"{api.pull}/comments/{root}/replies"
+    else:
+        destination = api.issue
+    anchor = "discussion_r" if inline else "issuecomment-"
+    url = f"{pull_request_url(api)}#{anchor}{int(comment['id'])}"
+    body = f"{ask_marker(request)}\n### Mortis answer\n\n[Question]({url})\n\n"
+    links = []
+    if report["status"] == "insufficient_context":
+        answer = safe_text(report["message"], 1000)
+    else:
+        result = report["result"]
+        answer = "\n\n".join(safe_text(paragraph, 6000) for paragraph in result["answer"].split("\n\n"))
+        server = os.environ["GITHUB_SERVER_URL"].rstrip("/")
+        for citation in result["citations"]:
+            path, sha = citation["path"], citation["sha"]
+            first, last = citation["start_line"], citation["end_line"]
+            line = f"L{first}" if first == last else f"L{first}-L{last}"
+            link = f"{server}/{api.owner}/{api.name}/blob/{sha}/{quote(path, safe='/')}#{line}"
+            links.append(f"\n- [{safe_text(path, 300)} · {line}]({link})")
+    heading = "\n\n**Sources**"
+    sources = heading + "".join(links) if links else ""
+    footer = ""
+    if report.get("limited_context"):
+        footer = "\n\nThe answer uses the diff that fit within the configured context limit."
+    if len((body + answer + sources + footer).encode()) > COMMENT_BODY_LIMIT:
+        footer += "\n\nSome text or sources were omitted to fit GitHub's comment limit."
+        available = COMMENT_BODY_LIMIT - len((body + footer).encode())
+        encoded = answer.encode()
+        # When sources alone are large, keep room for the answer.
+        source_limit = available - min(len(encoded), available // 2)
+        sources = ""
+        for link in links:
+            candidate = (sources or heading) + link
+            if len(candidate.encode()) <= source_limit:
+                sources = candidate
+        answer = encoded[:available - len(sources.encode())].decode("utf-8", errors="ignore")
+        answer = re.sub(r"&(?:#\d*)?$", "", answer).rstrip()
+    api.request("POST", destination, {"body": body + answer + sources + footer})
+
+
+def description_body(original, report):
+    block = f"{DESCRIPTION_START}\n### Mortis summary" + overview({"summary": report})
+    if report.get("limited_context"):
+        block += "\n\nThis summary uses the diff that fit within the configured context limit."
+    block += f"\n{DESCRIPTION_END}"
+    if DESCRIPTION_START not in original and DESCRIPTION_END not in original:
+        return original + ("\n\n" if original else "") + block
+    if original.count(DESCRIPTION_START) == original.count(DESCRIPTION_END) == 1:
+        first, last = original.index(DESCRIPTION_START), original.index(DESCRIPTION_END)
+        if first < last:
+            return original[:first] + block + original[last + len(DESCRIPTION_END):]
+    raise ValueError("The existing Mortis description block is incomplete or duplicated.")
+
+
+def finish_pr_command(api, pr, request, command, report):
+    if any(report[f"{side}_sha"] != pr[side]["sha"] for side in ("base", "head")):
+        raise ValueError("Mortis returned a result for different PR revisions.")
+    current = api.current(report)
+    if not current:
+        return 0, "skipped", "The PR changed while Mortis was working. Run the command again."
+    if command == "ask":
+        publish_answer(api, request, report)
+        return 0, "completed", "Mortis posted the answer."
+    if report["status"] == "insufficient_context":
+        return 0, "skipped", report["message"]
+    if any(current.get(key) != pr.get(key) for key in ("title", "body")):
+        return 0, "skipped", "The PR title or description was edited. Run /mortis describe again."
+    title = report["result"]["title"]
+    body = description_body(pr.get("body") or "", report)
+    if len(body) > 65_536:
+        raise ValueError("The Mortis summary would exceed GitHub's description limit.")
+    if title != current.get("title") or body != (current.get("body") or ""):
+        api.request("PATCH", api.pull, {"title": title, "body": body})
+    return 0, "completed", "Mortis updated the PR title and description."
 
 
 def publish(api, report, heading, *, repo=None, workflow_python=None, threads=None):
@@ -562,7 +710,19 @@ def publish(api, report, heading, *, repo=None, workflow_python=None, threads=No
     return True
 
 
-def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
+def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, request=None):
+    command = args[0]
+    api = GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"]) if pr and command != "scan" else None
+    reason = None
+    if command == "ask":
+        marker = ask_marker(request)
+        comments = f"{api.pull}/comments" if request["inline"] else api.issue
+        if any((row.get("user") or {}).get("login") == BOT and row["body"].startswith(marker)
+               for row in api.pages(comments)):
+            return 0, "skipped", "Mortis has already answered this comment."
+        question_args, reason = ask_arguments(api, request, directory)
+        if question_args:
+            args = [*args, *question_args]
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -604,13 +764,18 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
     config = mortis("config", "show", "--repo", repo, "--base", revision)
     if config.returncode:
         raise ValueError("Invalid repository configuration. " + config.stderr.strip())
-    command = args[0]
-    settings = json.loads(config.stdout)[command]["settings"]
-    if command == "review" and pr:
-        if not manual and not settings["automatic"]:
+    settings = json.loads(config.stdout)["scan" if command == "scan" else "review"]["settings"]
+    if api:
+        if command == "review" and not manual and not settings["automatic"]:
             return 0, "skipped", "Automatic review disabled in mortis.toml"
         if pr["user"]["type"] == "Bot" and not settings["include_bot_prs"]:
             return 0, "skipped", "Bot reviews disabled in mortis.toml"
+    if reason:
+        report = {"status": "insufficient_context", "message": reason,
+                  **{f"{side}_sha": pr[side]["sha"] for side in ("base", "head")}}
+        return finish_pr_command(api, pr, request, command, report)
+    if request and mortis(command, "--help").returncode:
+        raise ValueError(f"The pinned Mortis Engine does not support {command}. Install a compatible release.")
 
     model = settings["model"] or os.environ["MORTIS_MODEL"].strip()
     if not model:
@@ -639,7 +804,18 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
     connection = mortis(*connection_args)
     if connection.returncode:
         raise ValueError("Provider connection failed. " + connection.stderr.strip())
-    api = GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"]) if pr and command == "review" else None
+    if request:
+        result = mortis(*args, "--repo", repo, "--connection", "ci", "--format", "json")
+        if result.returncode:
+            raise ValueError(f"Mortis {command} failed. " + result.stderr.strip())
+        report = json.loads(result.stdout)
+        if report.get("schema_version") != f"mortis.{command}/v1" or report.get("status") not in {
+            "completed", "insufficient_context",
+        }:
+            raise ValueError(f"Mortis {command} returned an unsupported result.")
+        if report.get("run_id"):
+            output("run-id", report["run_id"])
+        return finish_pr_command(api, pr, request, command, report)
     threads = {}
     resolution_note = ""
     prior_args = []
@@ -701,12 +877,20 @@ def main():
         runner_temp = os.environ["RUNNER_TEMP"]
         with tempfile.TemporaryDirectory(prefix="mortis-work-", dir=runner_temp) as scratch:
             directory = Path(scratch)
+            manual = event_name in COMMENT_EVENTS
+            request = None
             if event_name in REMOTE_REVIEW_EVENTS:
                 if command != "review":
                     raise ValueError("This event supports only Mortis PR reviews.")
                 pr, reason = remote_pull_request(event_name, event)
                 repo = directory / "review.git"
                 args, revision = fetch_pull_request(repo, pr) if pr else (None, reason)
+                if args and manual:
+                    name, question = comment_command(event_name, event)
+                    if name != "review":
+                        args = [name, *args[1:]]
+                        request = {"question": question, "comment": event["comment"],
+                                   "inline": event_name == "pull_request_review_comment"}
             else:
                 pr = event.get("pull_request") if event_name == "pull_request" else None
                 repo = os.environ["GITHUB_WORKSPACE"]
@@ -717,7 +901,7 @@ def main():
                 # Runner-local outputs must outlive the temporary Engine state.
                 reports = Path(tempfile.mkdtemp(prefix="mortis-reports-", dir=runner_temp))
                 code, status, message = run_engine(
-                    args, repo, revision, pr, reports, directory, manual=event_name == "issue_comment"
+                    args, repo, revision, pr, reports, directory, manual=manual, request=request
                 )
     except subprocess.CalledProcessError as error:
         code, status, message = (
