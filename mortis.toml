@@ -1,4 +1,5 @@
 [review]
+auto_resolve = true
 review_sensitivity = "broad"
 effort = "medium"
 max_files = 100
