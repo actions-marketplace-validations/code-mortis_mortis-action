@@ -252,7 +252,7 @@ class ActionTests(unittest.TestCase):
             self.assertEqual(engine.call_args.args[:4], (args, repo, base, pr))
             self.assertTrue(engine.call_args.kwargs["manual"])
 
-    def run_mock(self, command, settings, pr=None, *, invalid=False, manual=False):
+    def run_mock(self, command, settings, pr=None, *, invalid=False, manual=False, threads=None):
         calls = []
         report = (
             review_report()
@@ -283,6 +283,11 @@ class ActionTests(unittest.TestCase):
             self.assertEqual(kwargs["env"]["MORTIS_API_KEY"], "test-provider-key")
             if argv[1] == "connect":
                 return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[1:] == ["review", "--help"]:
+                return subprocess.CompletedProcess(argv, 0, "--prior-findings" if threads else "", "")
+            if threads:
+                prior_file = Path(argv[argv.index("--prior-findings") + 1])
+                self.assertEqual(json.loads(prior_file.read_text()), list(threads.values()))
             Path(argv[-3]).write_text(json.dumps(report))
             Path(argv[-1]).write_text("# Report")
             return subprocess.CompletedProcess(argv, 2, "", "")
@@ -291,9 +296,25 @@ class ActionTests(unittest.TestCase):
             patch.object(action.subprocess, "run", side_effect=process),
             patch.object(action, "install_trivy") as trivy,
             patch.object(action, "publish", return_value=True),
+            patch.object(action.GitHubAPI, "finding_threads", return_value=threads) as list_threads,
+            patch.object(action, "resolve", return_value="a" * 40),
         ):
             result = action.run_engine([command], ".", "base", pr, self.reports, self.directory, manual=manual)
+            if threads:
+                list_threads.assert_called_once()
         return result, calls, trivy
+
+    def test_review_supplies_previous_findings_to_the_engine(self):
+        previous = {"id": "finding-" + "1" * 32, "source_sha": "a" * 40}
+        pr = pr_event()["pull_request"]
+        settings = {"automatic": True, "include_bot_prs": False, "auto_resolve": True, "model": ""}
+        result, calls, _ = self.run_mock("review", settings, pr, threads={"thread": previous})
+        self.assertEqual(result[:2], (2, "partial"))
+        self.assertIn("--prior-findings", calls[-1])
+        result, calls, _ = self.run_mock("review", settings, pr)
+        self.assertEqual(result[:2], (2, "partial"))
+        self.assertNotIn("--prior-findings", calls[-1])
+        self.assertIn("does not support PR finding verification", result[2])
 
     def test_automatic_and_bot_policy_skip_before_connect(self):
         for settings in ({"automatic": False}, {"automatic": True, "include_bot_prs": False}):
@@ -441,6 +462,62 @@ class PublicationTests(unittest.TestCase):
         self.api.is_current.side_effect = [True, False]
         self.assertFalse(action.publish(self.api, self.report, "Stale summary"))
         self.api.request.assert_not_called()
+
+    def test_open_threads_are_loaded_from_bot_comments_across_pages(self):
+        finding = {**self.report["findings"][0], "id": "finding-" + "1" * 32}
+        body = "<!-- mortis-action:finding:existing -->\n" + action.finding_metadata(finding, "a" * 40) + "Finding"
+        bot = {"login": "github-actions", "__typename": "Bot"}
+
+        def thread(thread_id, *, resolved=False, author=bot, comment=body):
+            return {"id": thread_id, "isResolved": resolved,
+                    "comments": {"nodes": [{"body": comment, "author": author}]}}
+
+        def page(nodes, cursor=None):
+            return {"repository": {"pullRequest": {"reviewThreads": {
+                "nodes": nodes, "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
+            }}}}
+
+        with patch.dict(os.environ, {"GITHUB_API_URL": "https://api.github.com"}):
+            api = action.GitHubAPI("owner/repo", 42)
+        with patch.object(api, "graphql", side_effect=[
+            page([thread("human", author={**bot, "__typename": "User"}), thread("closed", resolved=True)], "cursor"),
+            page([thread("open"), thread("legacy", comment="<!-- mortis-action:finding:legacy -->\nFinding")]),
+        ]) as graphql:
+            self.assertEqual(api.finding_threads(), {"open": {**finding, "source_sha": "a" * 40}})
+            self.assertEqual(graphql.call_args.args[1]["after"], "cursor")
+
+    def test_resolves_only_the_verified_thread_and_keeps_existing_open_findings_inline(self):
+        origin = "c" * 40
+        fixed = "finding-" + "1" * 32
+        open_id = "finding-" + "2" * 32
+        threads = {"fixed-thread": {"id": fixed, "source_sha": origin},
+                   "open-thread": {"id": open_id, "source_sha": origin}}
+        verification = {"status": "completed", "verdict": "fixed", "original_sha": origin,
+                        "head_sha": self.report["head_sha"]}
+        self.report["findings"][0]["id"] = open_id
+        self.report["history"] = [
+            {"id": fixed, "status": "resolved", "verification": verification},
+            {"id": open_id, "status": "open", "verification": {**verification, "verdict": "still_present"}},
+        ]
+
+        self.assertTrue(action.publish(self.api, self.report, "Partial", threads=threads))
+        self.api.resolve_thread.assert_not_called()
+        self.report.update(status="completed", workflow_status="completed")
+        self.api.is_current.side_effect = [True, True, False]
+        self.assertFalse(action.publish(self.api, self.report, "Stale", threads=threads))
+        self.api.resolve_thread.assert_not_called()
+        self.api.is_current.side_effect = None
+        self.assertTrue(action.publish(self.api, self.report, "Completed", threads=threads))
+        self.api.resolve_thread.assert_called_once_with("fixed-thread")
+        self.assertEqual(self.inline, [])
+        self.api.resolve_thread.reset_mock()
+        self.report.update(status="skipped", workflow_status="partial", findings=[],
+                           coverage={"selected": [], "waived": []})
+        self.assertTrue(action.publish(self.api, self.report, "Incomplete verification", threads=threads))
+        self.api.resolve_thread.assert_not_called()
+        self.report["workflow_status"] = "completed"
+        self.assertTrue(action.publish(self.api, self.report, "Verified without a diff", threads=threads))
+        self.api.resolve_thread.assert_called_once_with("fixed-thread")
 
     def test_suggestion_replaces_the_exact_multiline_range(self):
         self.set_suggestion()

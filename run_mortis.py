@@ -17,6 +17,8 @@ from urllib.parse import quote, urlsplit
 SUMMARY_MARKER = "<!-- mortis-action:review -->"
 BOT = "github-actions[bot]"
 COMMENT_BODY_LIMIT = 55_000
+FINDING_ID = re.compile(r"finding-[0-9a-f]{32}")
+FINDING_METADATA = "<!-- mortis-action:prior-finding:v1:"
 REMOTE_REVIEW_EVENTS = {"pull_request_target", "issue_comment"}
 TRIVY_VERSION = "0.76.0"
 TRIVY_ASSETS = {
@@ -255,6 +257,44 @@ def finding_text(finding):
     )
 
 
+def finding_metadata(finding, head):
+    identity = finding.get("id") or ""
+    if not FINDING_ID.fullmatch(identity):
+        return ""
+    value = {key: finding[key] for key in ("id", "path", "start_line", "end_line", "severity")}
+    value.update(source_sha=head, content=" ".join(finding["content"].split())[:400])
+    encoded = base64.b64encode(json.dumps(value, separators=(",", ":")).encode()).decode()
+    return f"{FINDING_METADATA}{encoded} -->\n"
+
+
+def tracked_finding(comment):
+    author = comment.get("author") or {}
+    if author.get("__typename") != "Bot" or author.get("login") not in {BOT, "github-actions"}:
+        return None
+    lines = comment["body"].split("\n", 2)
+    if len(lines) != 3 or not lines[0].startswith("<!-- mortis-action:finding:"):
+        return None
+    marker = lines[1]
+    if not marker.startswith(FINDING_METADATA) or not marker.endswith(" -->") or len(marker) > COMMENT_BODY_LIMIT:
+        return None
+    try:
+        finding = json.loads(base64.b64decode(marker[len(FINDING_METADATA):-4], validate=True))
+        if (
+            set(finding) == {"id", "path", "start_line", "end_line", "severity", "source_sha", "content"}
+            and FINDING_ID.fullmatch(finding["id"])
+            and re.fullmatch(r"[0-9a-f]{40}", finding["source_sha"])
+            and isinstance(finding["path"], str) and 0 < len(finding["path"]) <= 2000
+            and type(finding["start_line"]) is int and type(finding["end_line"]) is int
+            and 1 <= finding["start_line"] <= finding["end_line"]
+            and finding["severity"] in {"low", "medium", "high", "critical"}
+            and isinstance(finding["content"], str) and 0 < len(finding["content"]) <= 400
+        ):
+            return finding
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
 def summary(report, status, run_url):
     coverage = report["coverage"]
     if report["schema_version"] == "mortis.review/v1":
@@ -273,16 +313,24 @@ def summary(report, status, run_url):
 class GitHubAPI:
     def __init__(self, repository, number):
         self.endpoint = urlsplit(os.environ["GITHUB_API_URL"])
+        self.owner, self.name = repository.split("/")
+        self.number = int(number)
         self.repo = f"/repos/{repository}"
-        self.pull = f"/pulls/{int(number)}"
-        self.issue = f"/issues/{int(number)}/comments"
+        self.pull = f"/pulls/{self.number}"
+        self.issue = f"/issues/{self.number}/comments"
 
     def request(self, method, path, data=None, *, allow_invalid_anchor=False, allow_missing=False):
-        connection = http.client.HTTPSConnection(self.endpoint.netloc, timeout=30)
+        return self._request(
+            self.endpoint.netloc, method, self.endpoint.path.rstrip("/") + self.repo + path, data,
+            allow_invalid_anchor=allow_invalid_anchor, allow_missing=allow_missing,
+        )
+
+    def _request(self, host, method, path, data, *, allow_invalid_anchor=False, allow_missing=False):
+        connection = http.client.HTTPSConnection(host, timeout=30)
         try:
             connection.request(
                 method,
-                self.endpoint.path.rstrip("/") + self.repo + path,
+                path,
                 body=json.dumps(data) if data is not None else None,
                 headers={
                     "Authorization": f"Bearer {os.environ['MORTIS_GITHUB_TOKEN']}",
@@ -302,6 +350,54 @@ class GitHubAPI:
             return json.loads(body)
         finally:
             connection.close()
+
+    def graphql(self, query, variables):
+        endpoint = urlsplit(os.environ["GITHUB_GRAPHQL_URL"])
+        response = self._request(endpoint.netloc, "POST", endpoint.path, {"query": query, "variables": variables})
+        if response.get("errors") or not response.get("data"):
+            raise ValueError("GitHub could not read or resolve Mortis review threads. Check pull-requests permissions.")
+        return response["data"]
+
+    def finding_threads(self):
+        query = """
+            query($owner: String!, $name: String!, $number: Int!, $after: String) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  reviewThreads(first: 100, after: $after) {
+                    nodes {
+                      id
+                      isResolved
+                      comments(first: 1) { nodes { body author { login __typename } } }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+              }
+            }
+        """
+        variables = {"owner": self.owner, "name": self.name, "number": self.number, "after": None}
+        threads = {}
+        while True:
+            data = self.graphql(query, variables)
+            if not (pr := (data.get("repository") or {}).get("pullRequest")):
+                raise ValueError("GitHub did not return the pull request's review threads.")
+            page = pr["reviewThreads"]
+            for thread in page["nodes"]:
+                comments = thread["comments"]["nodes"]
+                if not thread["isResolved"] and comments and (finding := tracked_finding(comments[0])):
+                    threads[thread["id"]] = finding
+            if not page["pageInfo"]["hasNextPage"]:
+                return threads
+            variables = {**variables, "after": page["pageInfo"]["endCursor"]}
+
+    def resolve_thread(self, thread_id):
+        data = self.graphql("""
+            mutation($id: ID!) {
+              resolveReviewThread(input: {threadId: $id}) { thread { isResolved } }
+            }
+        """, {"id": thread_id})
+        if not data["resolveReviewThread"]["thread"]["isResolved"]:
+            raise ValueError("GitHub did not mark the Mortis thread as resolved.")
 
     def pages(self, path):
         page = 1
@@ -351,7 +447,7 @@ def overview(report):
     return body
 
 
-def publish(api, report, heading, *, repo=None, workflow_python=None):
+def publish(api, report, heading, *, repo=None, workflow_python=None, threads=None):
     if not api.is_current(report):
         return False
     findings = report["findings"]
@@ -380,8 +476,29 @@ def publish(api, report, heading, *, repo=None, workflow_python=None):
     elif existing["body"] != body:
         api.request("PATCH", f"/issues/comments/{existing['id']}", {"body": body})
 
+    threads = threads or {}
+    if (
+        threads and report["status"] in {"completed", "skipped"}
+        and report.get("workflow_status") == "completed" and not report["coverage"].get("waived")
+    ):
+        verified = {
+            (row["id"], verification["original_sha"])
+            for row in report.get("history", [])
+            if row["status"] == "resolved"
+            and (verification := row.get("verification"))
+            and verification["status"] == "completed"
+            and verification["verdict"] == "fixed"
+            and verification["head_sha"] == report["head_sha"]
+        }
+        for thread_id, finding in threads.items():
+            if (finding["id"], finding["source_sha"]) in verified:
+                if not api.is_current(report):
+                    return False
+                api.resolve_thread(thread_id)
+
     if not findings:
         return True
+    tracked = {finding["id"] for finding in threads.values()}
     paths = {finding["path"] for finding in findings}
     diff = {
         file["filename"]: dict(right_side_lines(file.get("patch") or ""))
@@ -395,6 +512,8 @@ def publish(api, report, heading, *, repo=None, workflow_python=None):
         if row["user"]["login"] == BOT and row["body"].startswith("<!-- mortis-action:finding:")
     }
     for finding in findings:
+        if finding.get("id") in tracked:
+            continue
         path = finding["path"]
         lines = diff.get(path, {})
         line = min(
@@ -415,7 +534,7 @@ def publish(api, report, heading, *, repo=None, workflow_python=None):
         if not api.is_current(report):
             return False
         payload = {
-            "body": f"{marker}\n{finding_text(finding)}",
+            "body": f"{marker}\n{finding_metadata(finding, report['head_sha'])}{finding_text(finding)}",
             "commit_id": report["head_sha"],
             "path": path,
             "line": line,
@@ -520,10 +639,38 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
     connection = mortis(*connection_args)
     if connection.returncode:
         raise ValueError("Provider connection failed. " + connection.stderr.strip())
+    api = GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"]) if pr and command == "review" else None
+    threads = {}
+    resolution_note = ""
+    prior_args = []
+    if api and settings.get("auto_resolve"):
+        if "--prior-findings" in mortis("review", "--help").stdout:
+            threads = api.finding_threads()
+            available = {}
+            prior = {}
+            for finding in threads.values():
+                sha = finding["source_sha"]
+                if sha not in available:
+                    try:
+                        resolve(repo, sha)
+                    except subprocess.CalledProcessError:
+                        available[sha] = False
+                    else:
+                        available[sha] = True
+                if available[sha]:
+                    prior.setdefault(finding["id"], finding)
+            if prior:
+                prior_path = directory / "prior-findings.json"
+                prior_path.write_text(json.dumps(list(prior.values())), encoding="utf-8")
+                prior_args = ["--prior-findings", prior_path]
+            if not all(available.values()):
+                resolution_note = "\n\nSome Mortis threads have an unavailable original commit and remain open."
+        else:
+            resolution_note = "\n\nThe installed Mortis Engine does not support PR finding verification."
     report_json = reports / "report.json"
     report_markdown = reports / "report.md"
     result = mortis(
-        *args, "--repo", repo, "--connection", "ci", "--output", report_json, "--output", report_markdown
+        *args, *prior_args, "--repo", repo, "--connection", "ci", "--output", report_json, "--output", report_markdown
     )
     for name, path in (("report-json", report_json), ("report-markdown", report_markdown)):
         if path.is_file():
@@ -534,11 +681,10 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False):
     output("run-id", report["run_id"])
     status = "partial" if result.returncode == 2 else "failed" if result.returncode else report["status"]
     url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-    heading = summary(report, status, url)
-    if pr and command == "review":
+    heading = summary(report, status, url) + resolution_note
+    if api:
         try:
-            api = GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"])
-            if not publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python"):
+            if not publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python", threads=threads):
                 heading += "\n\nThe PR changed during the run. Results apply to the recorded commit."
         except (ValueError, OSError, http.client.HTTPException) as error:
             return result.returncode or 1, "failed", f"{heading}\n\nPR publication failed. {error}"
