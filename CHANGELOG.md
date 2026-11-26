@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-26
+
+This revision uses Mortis Engine 0.1.7 and Trivy 0.76.2. Existing workflows can keep their provider, model, and encrypted history key.
+
+- Use `/mortis review --full` for a full review, or `/mortis preview` to see scope and exclusions before making a provider call. Inline and linked questions can use earlier messages from the same review thread.
+- Review PR retargets and filter unrelated comments before allocating a runner. Public GitHub.com repositories using automatic reviews must explicitly allow their workflow's `pull_request_target` event beginning December 2, 2026. Maintainers can also request reviews through a PR conversation.
+- Enable `auto-describe` to fill the Mortis description block from the opening review. Enable `check-linked-issues` and grant `issues: read` to check linked acceptance criteria with the configured provider.
+- Receive inline findings in groups of up to 25. Set `inline-min-severity` to route lower severities to the summary. Mortis protects discussions with replies and makes overflow findings available in the job summary or a seven-day Markdown index. Delivery counts are available as Action outputs.
+- Enable `publish-check` for a check on the reviewed head, or set `fail-on-severity` to enforce a threshold across current and carried-forward open findings. Both options require `checks: write`. PR workflows can read `policy-result` separately from the analysis status.
+- Scan summaries show severity counts. Set `retain-scan-findings: true` to retain a sanitized seven-day index of titles and locations.
+
 ## 0.2.2 - 2026-11-26
 
 Mortis Action now installs Mortis Engine 0.1.7. The first incremental PR review after upgrading reviews the full diff to establish a new baseline. Keep your existing `MORTIS_STATE_KEY` and workflow permissions.

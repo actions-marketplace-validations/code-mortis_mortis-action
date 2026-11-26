@@ -119,7 +119,9 @@ class RunnerTests(ActionTestCase):
                 "commit": "a" * 40,
                 "coverage": {"completed_files": 1, "selected_files": 3},
                 "findings": [],
-                "problems": ["Dependency inventory timed out. Token test.token"],
+                "stages": {"trivy": {"status": "partial"}},
+                "problems": ["Dependency inventory timed out. Token test.token",
+                             "Fix verification remains uncertain for a private finding title."],
             }
         )
 
@@ -156,7 +158,7 @@ class RunnerTests(ActionTestCase):
         with (
             patch.object(subprocess, "run", side_effect=process),
             patch.object(scanner, "install_trivy") as trivy,
-            patch.object(review, "publish", return_value=Mock(counts={}, summary="", warnings=[])),
+            patch.object(review, "publish", return_value=review.Delivery()),
             patch.object(github.GitHubAPI, "finding_threads", return_value=threads) as list_threads,
             patch.object(repository, "resolve", return_value="a" * 40),
         ):
@@ -168,7 +170,7 @@ class RunnerTests(ActionTestCase):
     def test_review_supplies_previous_findings_to_the_engine(self):
         previous = {"id": "finding-" + "1" * 32, "source_sha": "a" * 40,
                     "github_anchor": ("app.py", 1, 1), "evidence_digest": "f" * 64}
-        pr = pr_event()["pull_request"]
+        pr = pr_event("a" * 40, "b" * 40)["pull_request"]
         settings = {"automatic": True, "include_bot_prs": False, "auto_resolve": True, "model": ""}
         result, calls, _ = self.run_mock("review", settings, pr, threads={"thread": previous})
         self.assertEqual(result[:2], (2, "partial"))
@@ -224,7 +226,7 @@ class RunnerTests(ActionTestCase):
 
     def test_manual_reviews_work_with_automatic_reviews_disabled(self):
         result, _, _ = self.run_mock(
-            "review", {"automatic": False, "model": ""}, pr_event(fork=True)["pull_request"], manual=True
+            "review", {"automatic": False, "model": ""}, pr_event("a" * 40, "b" * 40, fork=True)["pull_request"], manual=True
         )
         self.assertEqual(result[:2], (2, "partial"))
 
@@ -233,7 +235,8 @@ class RunnerTests(ActionTestCase):
             result, calls, trivy = self.run_mock("scan", {"model": "committed-model"})
         self.assertEqual(result[:2], (2, "partial"))
         self.assertIn("1/3 files covered", result[2])
-        self.assertIn("Dependency inventory timed out", result[2])
+        self.assertIn("Incomplete scan stages: trivy", result[2])
+        self.assertNotIn("private finding title", result[2])
         self.assertNotIn("test&#46;token", result[2])
         trivy.assert_called_once()
         connect = next(call for call in calls if "connect" in call)
@@ -241,6 +244,16 @@ class RunnerTests(ActionTestCase):
         self.assertIn("run-id=scan-1", self.outputs.read_text())
         self.assertIn(f"report-json={self.reports / 'report.json'}", self.outputs.read_text())
         self.assertIn(f"report-markdown={self.reports / 'report.md'}", self.outputs.read_text())
+        self.assertNotIn("finding-index=", self.outputs.read_text())
+
+    def test_opt_in_scan_index_is_staged_even_for_a_partial_result(self):
+        with patch.dict(os.environ, {"MORTIS_RETAIN_SCAN_FINDINGS": "true"}):
+            result, _, _ = self.run_mock("scan", {"model": "scan-model"})
+        self.assertEqual(result[:2], (2, "partial"))
+        emitted = dict(line.split("=", 1) for line in self.outputs.read_text().splitlines())
+        index = Path(emitted["finding-index"])
+        self.assertIn("Scan findings (0)", index.read_text())
+        self.assertNotIn("Dependency inventory timed out", index.read_text())
 
     def test_review_uses_fallback_model_without_installing_trivy(self):
         result, calls, trivy = self.run_mock("review", {"model": ""})

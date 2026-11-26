@@ -1,14 +1,92 @@
 """Check PR comment authorization, anchors and ask and describe publication."""
 
+import json
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from mortis_action import commands, events, github, markdown
+import run_mortis
+from mortis_action import commands, events, github, markdown, repository
 from tests.helpers import ActionTestCase, comment_event, pr_event, review_report
 
 
 class PullRequestTests(ActionTestCase):
+    def test_retargets_review_new_base_and_other_edits_skip_before_api_calls(self):
+        event = {**pr_event(), "action": "edited", "changes": {"body": {"from": "old body"}}}
+        with patch.object(github.GitHubAPI, "request", return_value=event["pull_request"]) as request:
+            self.assertIsNone(events.remote_pull_request("pull_request_target", event)[0])
+            self.assertIsNone(events.select_run("review", "pull_request", event, "")[0])
+            request.assert_not_called()
+            event["changes"] = {"base": {"ref": {"from": "release"}}}
+            self.assertEqual(events.remote_pull_request("pull_request_target", event), (event["pull_request"], None))
+            request.assert_called_once_with("GET", "/pulls/42")
+
+    def test_scope_preview_is_a_single_authorized_conversation_reply_without_provider_calls(self):
+        base, head = "a" * 40, "b" * 40
+        pr = pr_event(base, head, fork=True)["pull_request"]
+        event = comment_event("  /mortis preview\n")
+        event["comment"]["id"] = 58
+        self.assertIsNone(events.comment_command("pull_request_review_comment", event))
+        self.assertIsNone(events.comment_command("issue_comment", comment_event("/mortis preview extra")))
+        self.assertEqual(events.comment_command("issue_comment", comment_event(" /mortis review --full\n")),
+                         ("review", "full"))
+        event_path = self.directory / "preview-event.json"
+        event_path.write_text(json.dumps(event))
+        report = {"schema_version": "mortis.review-preview/v1", "base_sha": base, "head_sha": head,
+                  "totals": {"selected_files": 1, "excluded_files": 1, "planned_batches": 1},
+                  "selected_files": [{"path": "app.py"}], "excluded_files": [{"path": "metal.bin", "reason": "binary"}],
+                  "bounds": {"max_files": 10}, "limit_reason": "File limit reached", "errors": []}
+        comments = []
+        calls = []
+
+        def process(argv, **kwargs):
+            self.assertNotIn("MORTIS_API_KEY", kwargs["env"])
+            self.assertNotIn("MORTIS_STATE_KEY", kwargs["env"])
+            if Path(argv[0]).name == "mortis":
+                calls.append(argv[1:])
+                if argv[1] == "config":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"review": {"settings": {}}}), "")
+                self.assertEqual(argv[1:6], ["review", "--base", base, "--head", head])
+                self.assertEqual(argv[-3:], ["--preview", "--format", "json"])
+                return subprocess.CompletedProcess(argv, 2, json.dumps(report), "")
+            return subprocess.CompletedProcess(argv, 0)
+
+        def request(method, path, data=None, **kwargs):
+            if path.endswith("/permission"):
+                return {"permission": "write"}
+            if method == "GET":
+                return pr
+            self.assertEqual((method, path), ("POST", "/issues/42/comments"))
+            comments.append({"user": {"login": github.BOT}, **data})
+
+        with (
+            patch.dict(os.environ, {"RUNNER_OS": "Linux", "RUNNER_TEMP": str(self.directory),
+                                    "MORTIS_COMMAND": "review", "GITHUB_EVENT_NAME": "issue_comment",
+                                    "GITHUB_EVENT_PATH": str(event_path), "MORTIS_MODEL": "", "MORTIS_API_KEY": ""}),
+            patch.object(github.GitHubAPI, "request", side_effect=request),
+            patch.object(github.GitHubAPI, "pages", side_effect=lambda path: comments),
+            patch.object(repository, "fetch_pull_request", return_value=(["review", "--base", base, "--head", head], base)),
+            patch.object(subprocess, "run", side_effect=process),
+            patch("builtins.print"),
+        ):
+            run_mortis.main()
+            run_mortis.main()
+        self.assertEqual([argv[0] for argv in calls], ["config", "review"])
+        self.assertIn("status=partial", self.outputs.read_text())
+        self.assertIn("status=skipped", self.outputs.read_text())
+        self.assertNotIn("baseline-", self.outputs.read_text())
+        self.assertEqual(len(comments), 1)
+        for part in ("Full comparison scope", "1 planned batch", "app", "metal", "binary", "file limit is 10",
+                     "File limit reached"):
+            self.assertIn(part, comments[0]["body"])
+        with patch.object(github.GitHubAPI, "is_current", return_value=False), patch.object(github.GitHubAPI, "request") as write:
+            api = github.GitHubAPI("owner/repo", 42)
+            self.assertEqual(commands.publish_preview(api, pr, event, report, 0)[1], "skipped")
+            with self.assertRaises(ValueError):
+                commands.publish_preview(api, pr, event, {**report, "head_sha": base}, 0)
+            write.assert_not_called()
+
     def test_full_review_is_an_exact_authorized_conversation_command(self):
         name = "issue_comment"
         event = comment_event("/mortis review --full")
@@ -84,6 +162,57 @@ class PullRequestTests(ActionTestCase):
             commands.publish_answer(api, inline, {"status": "insufficient_context", "message": "Outdated anchor."})
             self.assertEqual(request.call_args.args[:2], ("POST", "/pulls/42/comments/3/replies"))
             self.assertIn("#discussion_r4", request.call_args.args[2]["body"])
+
+    def test_inline_and_fork_questions_include_only_recent_prior_comments_from_the_selected_thread(self):
+        api = github.GitHubAPI("owner/repo", 42)
+        url = "https://api.github.com/repos/owner/repo/pulls/42"
+        root = {"id": 1, "pull_request_url": url, "path": "app.py", "line": 3, "side": "RIGHT",
+                "body": "<!-- machine metadata -->Why is this check needed?"}
+        reply = {**root, "id": 8, "in_reply_to_id": 1, "body": "It protects concurrent writes."}
+        rows = [root, reply, {**reply, "id": 9, "body": "test-provider-key"},
+                {**reply, "id": 10, "body": "duplicate question", "created_at": "2026-02-02T00:00:00Z"},
+                {**reply, "id": 11, "body": "future reply", "created_at": "2026-02-03T00:00:00Z"},
+                {**reply, "id": 7, "in_reply_to_id": 6, "body": "different thread"},
+                {**reply, "id": 4, "pull_request_url": "wrong", "body": "different PR"}]
+        current = {"id": 10, "in_reply_to_id": 1, "created_at": "2026-02-01T00:00:00Z"}
+        for inline in (True, False):
+            link = "" if inline else "\nhttps://github.com/owner/repo/pull/42/files#discussion_r8"
+            command = {"inline": inline, "comment": current, "question": "Why is that safer?" + link}
+            with patch.object(api, "request", side_effect=[root if inline else reply, sorted(rows, key=lambda r: -r["id"])]):
+                args, reason = commands.ask_arguments(api, command, self.directory)
+            self.assertIsNone(reason)
+            text = Path(args[1]).read_text()
+            for included in ("Why is this check needed?", "It protects concurrent writes.", "[redacted]"):
+                self.assertIn(included, text)
+            for omitted in ("machine metadata", "duplicate question", "future reply", "different thread", "different PR",
+                            "test-provider-key"):
+                self.assertNotIn(omitted, text)
+            self.assertTrue(text.endswith("Current question:\nWhy is that safer?"))
+
+        for question in ("W" * 7999, "X" * 8000):
+            self.assertEqual(commands.question_with_history(api, {"inline": True, "comment": current}, root, question),
+                             question)
+        with patch.object(api, "request", side_effect=TimeoutError):
+            self.assertEqual(commands.question_with_history(api, {"inline": True, "comment": current}, root, "Why?"), "Why?")
+
+    def test_history_pages_past_unrelated_discussions_and_stops_at_the_root(self):
+        api = github.GitHubAPI("owner/repo", 42)
+        root = {"id": 50, "pull_request_url": "https://api.github.com/repos/owner/repo/pulls/42", "body": "First message"}
+        reply = {**root, "id": 55, "in_reply_to_id": 50, "body": "Prior answer"}
+        unrelated = [{**root, "id": n, "body": "Unrelated"} for n in range(200, 100, -1)]
+        # Both full pages would trigger a third fetch if the root did not stop the search.
+        second = [reply, root, *[{**root, "id": 40, "body": "Older"}] * 98]
+        request = {"inline": True, "comment": {"id": 58}}
+        with patch.object(api, "request", side_effect=[unrelated, second]) as get:
+            text = commands.question_with_history(api, request, root, "Why?")
+        self.assertEqual([call.args[1] for call in get.call_args_list],
+                         [f"/pulls/42/comments?sort=created&direction=desc&per_page=100&page={p}" for p in (1, 2)])
+        self.assertIn('"First message"\n"Prior answer"', text)
+        self.assertNotIn("Unrelated", text)
+        self.assertNotIn("Older", text)
+        self.assertTrue(text.endswith("Why?"))
+        with patch.object(api, "request", side_effect=[unrelated, TimeoutError()]):
+            self.assertEqual(commands.question_with_history(api, request, root, "Why?"), "Why?")
 
     def test_ask_caps_rendered_comment_bytes_and_preserves_complete_citations(self):
         api = github.GitHubAPI("owner/repo", 42)
