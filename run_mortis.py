@@ -19,11 +19,13 @@ from mortis_action import (
     commands,
     events,
     github,
+    linked_issues,
     markdown,
     repository,
     review,
     trivy,
 )
+from mortis_action.markdown import redact_credentials
 
 
 def append(path, message):
@@ -37,14 +39,13 @@ def output(name, value):
     append("GITHUB_OUTPUT", f"{name}={value}")
 
 
-def redact_credentials(message):
-    secrets = (os.environ.get(name, "") for name in ("MORTIS_API_KEY", "MORTIS_GITHUB_TOKEN", "MORTIS_STATE_KEY"))
-    for secret in sorted(filter(None, secrets), key=len, reverse=True):
-        message = message.replace(secret, "[redacted]")
-    return message
+def annotation(level, message):
+    message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", redact_credentials(message))[:2000]
+    message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level}::{message}")
 
 
-def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, request=None):
+def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, request=None, auto_describe=False):
     command = args[0]
     api = github.GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"]) if pr and command != "scan" else None
     reason = None
@@ -153,7 +154,7 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
         if report.get("run_id"):
             output("run-id", report["run_id"])
         return commands.finish_pr_command(api, pr, request, command, report)
-    threads = {}
+    threads = None
     resolution_note = ""
     prior_args = []
     checkpoint = None
@@ -171,10 +172,13 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                 state_note = "\n\nReview history could not be restored. Check Actions read permissions and the state key."
     if api and settings.get("auto_resolve"):
         if "--prior-findings" in mortis("review", "--help").stdout:
-            threads = api.finding_threads()
+            try:
+                threads = api.finding_threads()
+            except (ValueError, OSError, http.client.HTTPException):
+                resolution_note = "\n\nMortis could not load the GitHub threads for automatic resolution."
             available = {}
             prior = {}
-            for finding in threads.values():
+            for finding in (threads or {}).values():
                 sha = finding["source_sha"]
                 if sha not in available:
                     try:
@@ -184,7 +188,8 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                     else:
                         available[sha] = True
                 if available[sha]:
-                    prior.setdefault(finding["id"], finding)
+                    engine_fields = ("id", "source_sha", "path", "start_line", "end_line", "severity", "content")
+                    prior.setdefault(finding["id"], {k: finding[k] for k in engine_fields if k in finding})
             if prior:
                 prior_path = directory / "prior-findings.json"
                 prior_path.write_text(json.dumps(list(prior.values())), encoding="utf-8")
@@ -212,12 +217,40 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     output("run-id", report["run_id"])
     status = "partial" if result.returncode == 2 else "failed" if result.returncode else report["status"]
     url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-    heading = markdown.summary(report, status, url) + resolution_note + state_note
+    heading = markdown.summary(report, status, url, full_review=manual and "--no-incremental" in args)
+    heading += resolution_note + state_note
     if api:
+        issue_section = None
+        if (os.environ.get("MORTIS_CHECK_LINKED_ISSUES", "").lower() == "true" and status != "failed"
+                and linked_issues.references(api, pr.get("body"))):
+            def ask(question):
+                path = directory / "issue-question.txt"
+                path.write_text(question, encoding="utf-8")
+                answer = mortis("ask", "--base", report["base_sha"], "--head", report["head_sha"],
+                                "--repo", repo, "--connection", "ci", "--question-file", path, "--format", "json")
+                if answer.returncode:
+                    raise ValueError("Mortis could not assess this requirement.")
+                return json.loads(answer.stdout)
+
+            def issue_section(previous_body):
+                config = {"settings": settings, "connection": connection_args, "engine": packages[0]}
+                return linked_issues.section(api, pr, report, previous_body, config, ask)
+
         try:
-            published = review.publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python", threads=threads)
+            published = review.publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python",
+                                       threads=threads, auto_resolve=settings.get("auto_resolve", False),
+                                       issue_section=issue_section)
             if not published:
                 heading += "\n\nThe PR changed during the run. Results apply to the recorded commit."
+            else:
+                for name, count in published.counts.items():
+                    output(name, count)
+                heading += "\n\n" + published.summary
+                for warning in published.warnings:
+                    annotation("warning", warning)
+                if auto_describe and status == "completed" and (note := commands.auto_describe(api, pr, report)):
+                    heading += "\n\n" + note
+                    annotation("warning", note)
         except (ValueError, OSError, http.client.HTTPException) as error:
             return result.returncode or 1, "failed", f"{heading}\n\nPR publication failed. {error}"
         if published and checkpoint is not None:
@@ -260,7 +293,9 @@ def main():
                 args, revision = repository.fetch_pull_request(repo, pr) if pr else (None, reason)
                 if args and manual:
                     name, question = events.comment_command(event_name, event)
-                    if name != "review":
+                    if name == "review" and question == "full":
+                        args = [*args, "--no-incremental", "--no-skip-unchanged"]
+                    elif name != "review":
                         args = [name, *args[1:]]
                         request = {"question": question, "comment": event["comment"],
                                    "inline": event_name == "pull_request_review_comment"}
@@ -274,7 +309,10 @@ def main():
                 # Runner-local outputs must outlive the temporary Engine state.
                 reports = Path(tempfile.mkdtemp(prefix="mortis-reports-", dir=runner_temp))
                 code, status, message = run_engine(
-                    args, repo, revision, pr, reports, directory, manual=manual, request=request
+                    args, repo, revision, pr, reports, directory, manual=manual, request=request,
+                    auto_describe=(os.environ.get("MORTIS_AUTO_DESCRIBE", "").lower() == "true"
+                                   and event_name in {"pull_request", "pull_request_target"}
+                                   and event.get("action") in {"opened", "ready_for_review"}),
                 )
     except subprocess.CalledProcessError as error:
         code, status, message = (
@@ -286,10 +324,7 @@ def main():
         code, status, message = 1, "failed", str(error)
     message = redact_credentials(message)
     if status in {"failed", "partial"}:
-        level = "error" if status == "failed" else "warning"
-        diagnostic = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)[:2000]
-        diagnostic = diagnostic.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print(f"::{level}::{diagnostic}")
+        annotation("error" if status == "failed" else "warning", message)
     else:
         print(f"Mortis action {status}. See the job summary for details.")
     if not message.startswith("## Mortis "):

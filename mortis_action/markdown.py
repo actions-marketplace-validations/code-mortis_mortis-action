@@ -1,6 +1,22 @@
 """Render shared review text, change overviews and workflow summaries."""
 
+import html
+import os
 import re
+from urllib.parse import unquote
+
+
+def redact_credentials(text):
+    values = (os.environ.get(name) for name in ("MORTIS_API_KEY", "MORTIS_GITHUB_TOKEN", "MORTIS_STATE_KEY"))
+    for secret in sorted(filter(None, values), key=len, reverse=True):
+        text = text.replace(secret, "[redacted]")
+    return text
+
+
+def contains_rendered_credential(markdown):
+    # Labels use HTML entities and citation URLs use percent-encoded paths.
+    visible = html.unescape(markdown)
+    return any(redact_credentials(text) != text for text in (markdown, visible, unquote(visible)))
 
 
 def safe_text(value, limit):
@@ -53,7 +69,7 @@ def earlier_open_findings(report):
     ]
 
 
-def summary(report, status, run_url):
+def summary(report, status, run_url, *, full_review=False):
     coverage = report["coverage"]
     details = ""
     findings = f"{len(report['findings'])} findings"
@@ -61,8 +77,17 @@ def summary(report, status, run_url):
         done, selected = len(coverage["completed"]), len(coverage["selected"])
         label, revision = "review", report["head_sha"]
         reused = coverage.get("reused", [])
-        if report.get("comparison"):
-            details = file_list("Files reviewed", coverage["completed"]) + file_list("Files reused", reused)
+        comparison = report.get("comparison") or {}
+        if full_review:
+            details = "\n\nFull review requested manually."
+        elif comparison:
+            mode = safe_text(comparison["strategy"].replace("_", " "), 80)
+            reason = safe_text((comparison.get("reason") or "").replace("_", " "), 160)
+            details = f"\n\nReview mode **{mode}**" + (f" ({reason})" if reason else "") + "."
+        elif report.get("mode") == "commits":
+            details = "\n\nReview mode **full** (coverage reuse disabled)."
+        if comparison:
+            details += file_list("Files reviewed", coverage["completed"]) + file_list("Files reused", reused)
         done += len(reused)
         if earlier := earlier_open_findings(report):
             findings += f" · {len(earlier)} earlier open"

@@ -2,13 +2,37 @@
 
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from mortis_action import commands, events, github
-from tests.helpers import ActionTestCase, comment_event, pr_event
+from mortis_action import commands, events, github, markdown
+from tests.helpers import ActionTestCase, comment_event, pr_event, review_report
 
 
 class PullRequestTests(ActionTestCase):
+    def test_full_review_is_an_exact_authorized_conversation_command(self):
+        name = "issue_comment"
+        event = comment_event("/mortis review --full")
+        self.assertEqual(events.comment_command(name, event), ("review", "full"))
+        self.assertIsNone(events.comment_command("pull_request_review_comment", event))
+        for body in ("/mortis review --full extra", "/mortis review --full\nmessage", "/mortis review --other"):
+            self.assertIsNone(events.comment_command(name, comment_event(body)))
+        with patch.object(github.GitHubAPI, "request", return_value={"permission": "read"}) as request:
+            self.assertIsNone(events.remote_pull_request(name, event)[0])
+            request.assert_called_once_with("GET", "/collaborators/maintainer/permission", allow_missing=True)
+
+    def test_review_mode_is_visible_for_incremental_and_forced_full_reviews(self):
+        report = review_report()
+        full = markdown.summary(report, "completed", "run-url", full_review=True)
+        self.assertIn("Full review requested manually", full)
+        report.update(comparison={"strategy": "full", "reason": "no_baseline"},
+                      coverage={"selected": [], "completed": []})
+        normal = markdown.summary(report, "completed", "run-url")
+        self.assertIn("**full** (no baseline)", normal)
+        scan = {"schema_version": "mortis.scan/v1", "findings": [], "commit": "abcd",
+                "coverage": {"completed_files": 0, "selected_files": 0}}
+        self.assertEqual(markdown.summary(scan, "completed", "url", full_review=True),
+                         markdown.summary(scan, "completed", "url"))
+
     def test_comment_admission_checks_command_and_author_before_fetching_pr(self):
         pr = pr_event(fork=True)["pull_request"]
         with patch.object(github.GitHubAPI, "request") as request:
@@ -111,3 +135,34 @@ class PullRequestTests(ActionTestCase):
             current.return_value = None
             self.assertEqual(commands.finish_pr_command(api, pr, {}, "describe", report)[1], "skipped")
             request.assert_not_called()
+
+    def test_auto_describe_reuses_completed_summary_and_only_updates_body(self):
+        pr = {**pr_event()["pull_request"], "title": "Author title", "body": "Author notes"}
+        summary = {"status": "completed", "limited_context": True,
+                   "result": {"narrative": "Use the new format.", "groups": []}}
+        report = {"status": "completed", "base_sha": "base", "head_sha": "head", "summary": summary}
+        api = Mock(pull="/pulls/42")
+        api.current.return_value = pr
+        self.assertEqual(commands.auto_describe(api, pr, report), "")
+        body = commands.description_body(pr["body"], summary)
+        self.assertTrue(body.startswith("Author notes\n\n"))
+        self.assertIn("Use the new format", body)
+        self.assertIn("configured context limit", body)
+        api.request.assert_called_once_with("PATCH", api.pull, {"body": body})
+
+        api.request.reset_mock()
+        self.assertEqual(commands.auto_describe(api, {**pr, "body": body}, report), "")
+        for changes in ({"status": "partial"}, {"summary": None}, {"summary": {"status": "skipped"}},
+                        {"summary": {"status": "completed", "result": {}}}):
+            self.assertEqual(commands.auto_describe(api, pr, {**report, **changes}), "")
+        self.assertTrue(commands.auto_describe(api, pr, {**report, "head_sha": "unrelated"}))
+        for current in (None, {**pr, "body": "Fresh author edit"}):
+            api.current.return_value = current
+            self.assertTrue(commands.auto_describe(api, pr, report))
+        for original in (commands.DESCRIPTION_START, "a" * 65_536):
+            self.assertTrue(commands.auto_describe(api, {**pr, "body": original}, report))
+        api.request.assert_not_called()
+
+        api.current.return_value = pr
+        api.request.side_effect = ValueError("denied")
+        self.assertTrue(commands.auto_describe(api, pr, report))

@@ -44,6 +44,8 @@ def comment_command(event_name, event):
     body = comment.get("body", "")
     if not inline and body == "/mortis review":
         return "review", None
+    if not inline and body == "/mortis review --full":
+        return "review", "full"
     if not inline and body.strip() == "/mortis describe":
         return "describe", None
     if match := re.fullmatch(r"/mortis ask\s+(\S.*)", body.strip(), re.DOTALL):

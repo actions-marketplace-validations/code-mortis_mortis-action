@@ -10,6 +10,8 @@ Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons
 
 Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. Drafts and Dependabot PRs are skipped. Other bot-authored PRs require `include_bot_prs = true`.
 
+On an Action revision that includes the full-review command, use `/mortis review --full` to review every eligible change once under the configured review limits. Mortis restores available finding history, bypasses incremental and identical-tree reuse for that run, and saves the result for subsequent reviews.
+
 ### Ask or describe
 
 With an action commit that installs Mortis Engine 0.1.5 or later, users with repository write access can post these commands on an open PR:
@@ -31,6 +33,19 @@ The existing `contents: read` and `pull-requests: write` permissions are suffici
 
 The workflow uses `pull_request_target` and `issue_comment`. The action fetches PR commits into a temporary bare Git repository and reads them as data. It compares the exact head to the merge base and loads `mortis.toml` from the **target commit**. Mortis updates one summary comment with the change overview, coverage, and confirmed findings. It also posts findings inline when GitHub can anchor them to added lines.
 
+### Automatic descriptions and linked issues
+
+Pin an Action revision containing these inputs before enabling them. The bundled v0.2.2 pin predates both options. Set either input under the Action step's `with` block.
+
+| Input | Default | Behavior |
+| --- | --- | --- |
+| `auto-describe` | `false` | On opening a PR or marking it ready for review, copy the completed review overview into the Mortis block in the PR body. This uses the existing review result and adds no provider calls. |
+| `check-linked-issues` | `false` | During an eligible automatic or manual review, check requirements from explicitly linked issues in the same repository. Grant `issues: read` to the review job. |
+
+Link an issue in the author-written PR description with a closing reference such as `Closes #123`. Mortis reads up to three linked issues and assesses up to six requirements in document order. Use a Markdown task list or bullets under an **Acceptance criteria** heading for separate assessments. A prose-only issue receives one issue-level assessment.
+
+Each fresh assessment sends the selected requirement and eligible PR diff to the configured provider. The PR summary includes the answer and source links, or shows **Unverified** for insufficient evidence and **Unavailable** when the check could not run. These assessments are advisory. Mortis reuses matching results for the same review inputs and checks edited issues on the next PR review, including an unchanged-code run.
+
 When an Engine-supported replacement matches the complete line range in the current PR diff, the inline comment includes a GitHub suggestion. For workflow files, Mortis also checks that the resulting YAML parses and has unique mapping keys. Use **Commit suggestion** to apply the replacement to the PR branch.
 
 Set `auto_resolve = true` under `[review]` in the target branch's `mortis.toml` to verify findings carried by incremental review history. Mortis resolves a matching GitHub thread only after the Engine verifies the fix against the current PR head. Resolving threads from GitHub comments alone requires an Engine release with `review --prior-findings`.
@@ -43,7 +58,7 @@ Set `incremental = true` under `[review]` in the target branch's `mortis.toml`. 
 
 With Engine 0.1.7, incremental reviews also recheck previously reviewed Python importers when a module-level function’s required parameters change or it gains or loses `*args` or `**kwargs`. Fully reverting a previously reviewed file change can trigger a fresh review of the remaining diff.
 
-Set `skip_unchanged = true` to reuse compatible coverage when the head tree is identical, including complete caller coverage. The job summary and PR comment list reviewed and reused files. The PR comment also keeps earlier open findings from the saved history.
+Set `skip_unchanged = true` to reuse compatible coverage when the head tree is identical, including complete caller coverage. The job summary and PR comment list reviewed and reused files and the reason for reuse. The PR comment keeps its previous change overview when identical content was already reviewed, along with earlier open findings from saved history.
 
 Generate a key with `openssl rand -base64 32` and store it as the `MORTIS_STATE_KEY` repository secret. The bundled workflow passes the key to the action and grants `actions: read`. For a custom workflow, add those settings and serialize review jobs per PR using a concurrency group. Use an action revision that includes incremental review support.
 
@@ -132,6 +147,8 @@ timeout_seconds = 600
 The engine supplies defaults when the file is absent and rejects invalid configuration before contacting the provider. A model in the effective Engine settings takes precedence over the action’s `model` input. The provider preset and API key come from the workflow. Use the optional `protocol` and `base-url` inputs to override the preset’s connection settings.
 
 The Actions summary shows status and coverage. The action exposes `status` (`completed`, `partial`, `failed`, or `skipped`), `run-id`, `report-json`, and `report-markdown`. Report outputs are runner-local paths for subsequent steps in the same job. Partial results keep their reports and return exit code 2. A later step can use `if: ${{ !cancelled() && steps.mortis.outputs.report-json != '' }}` to consume available reports, including after a failure. Reports may include source evidence. Successful analysis with findings exits 0.
+
+For a published PR review, four additional outputs count the current findings. `inline-posted` counts new comments, `inline-existing` counts findings with an existing comment, `summary-only` counts findings without an eligible inline location, and `inline-failed` counts delivery failures. An inline failure reported in the PR summary or a denied thread resolution produces a warning. Failure to publish the required summary fails the job.
 
 ## Development
 

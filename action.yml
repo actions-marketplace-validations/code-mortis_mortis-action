@@ -25,6 +25,12 @@ inputs:
   review-forks:
     description: Automatically review fork PRs on pull_request_target
     default: "false"
+  auto-describe:
+    description: Fill the PR description summary from the opening or ready-for-review run
+    default: "false"
+  check-linked-issues:
+    description: Assess requirements from explicitly linked issues using additional provider requests
+    default: "false"
 outputs:
   status:
     description: "Result status: completed, partial, failed, or skipped"
@@ -38,6 +44,18 @@ outputs:
   report-markdown:
     description: Absolute path to the Markdown report, when available
     value: ${{ steps.mortis.outputs.report-markdown }}
+  inline-posted:
+    description: Current findings posted as new inline comments
+    value: ${{ steps.mortis.outputs.inline-posted }}
+  inline-existing:
+    description: Current findings already represented by an inline comment
+    value: ${{ steps.mortis.outputs.inline-existing }}
+  summary-only:
+    description: Current findings without an eligible inline location
+    value: ${{ steps.mortis.outputs.summary-only }}
+  inline-failed:
+    description: Current findings for which inline delivery failed
+    value: ${{ steps.mortis.outputs.inline-failed }}
 runs:
   using: composite
   steps:
@@ -58,6 +76,8 @@ runs:
         MORTIS_BASE_URL: ${{ inputs.base-url }}
         MORTIS_MODEL: ${{ inputs.model }}
         MORTIS_REVIEW_FORKS: ${{ inputs.review-forks }}
+        MORTIS_AUTO_DESCRIBE: ${{ inputs.auto-describe }}
+        MORTIS_CHECK_LINKED_ISSUES: ${{ inputs.check-linked-issues }}
         MORTIS_GITHUB_TOKEN: ${{ github.token }}
       run: python -I "$GITHUB_ACTION_PATH/run_mortis.py"
     - name: Save Mortis review history

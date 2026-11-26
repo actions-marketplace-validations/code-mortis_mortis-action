@@ -144,7 +144,11 @@ class RunnerTests(ActionTestCase):
                 return subprocess.CompletedProcess(argv, 0, "--prior-findings" if threads else "", "")
             if threads:
                 prior_file = Path(argv[argv.index("--prior-findings") + 1])
-                self.assertEqual(json.loads(prior_file.read_text()), list(threads.values()))
+                prior = json.loads(prior_file.read_text())
+                self.assertEqual([item["id"] for item in prior], [item["id"] for item in threads.values()])
+                for item in prior:
+                    self.assertNotIn("github_anchor", item)
+                    self.assertNotIn("evidence_digest", item)
             Path(argv[-3]).write_text(json.dumps(report))
             Path(argv[-1]).write_text("# Report")
             return subprocess.CompletedProcess(argv, 2, "", "")
@@ -152,7 +156,7 @@ class RunnerTests(ActionTestCase):
         with (
             patch.object(subprocess, "run", side_effect=process),
             patch.object(scanner, "install_trivy") as trivy,
-            patch.object(review, "publish", return_value=True),
+            patch.object(review, "publish", return_value=Mock(counts={}, summary="", warnings=[])),
             patch.object(github.GitHubAPI, "finding_threads", return_value=threads) as list_threads,
             patch.object(repository, "resolve", return_value="a" * 40),
         ):
@@ -162,7 +166,8 @@ class RunnerTests(ActionTestCase):
         return result, calls, trivy
 
     def test_review_supplies_previous_findings_to_the_engine(self):
-        previous = {"id": "finding-" + "1" * 32, "source_sha": "a" * 40}
+        previous = {"id": "finding-" + "1" * 32, "source_sha": "a" * 40,
+                    "github_anchor": ("app.py", 1, 1), "evidence_digest": "f" * 64}
         pr = pr_event()["pull_request"]
         settings = {"automatic": True, "include_bot_prs": False, "auto_resolve": True, "model": ""}
         result, calls, _ = self.run_mock("review", settings, pr, threads={"thread": previous})
@@ -272,7 +277,7 @@ class RunnerTests(ActionTestCase):
             "GITHUB_WORKSPACE": str(self.directory),
             "MORTIS_COMMAND": "scan",
         }
-        def engine(args, repo, revision, pr, reports, directory, *, manual, request):
+        def engine(args, repo, revision, pr, reports, directory, *, manual, request, auto_describe):
             for name, filename in (("report-json", "report.json"), ("report-markdown", "report.md")):
                 path = reports / filename
                 path.write_text("Partial report")
