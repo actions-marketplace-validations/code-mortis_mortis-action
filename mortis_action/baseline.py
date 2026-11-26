@@ -50,7 +50,6 @@ class ReviewBaseline:
     def restore(self, base, head):
         response = self.api.request("GET", f"/actions/artifacts?name={self.name}&per_page=10")
         candidates = sorted(response["artifacts"], key=lambda row: row["created_at"], reverse=True)
-        rejected = False
         for artifact in candidates:
             if artifact["expired"] or artifact["name"] != self.name:
                 continue
@@ -71,10 +70,9 @@ class ReviewBaseline:
             except (
                 KeyError, ValueError, OSError, zipfile.BadZipFile, RuntimeError, subprocess.CalledProcessError,
                 http.client.HTTPException, zlib.error,
-            ):
-                rejected = True
-        if rejected:
-            raise ValueError("No valid Mortis baseline could be restored.")
+            ) as error:
+                # An older artifact can omit open findings from the unreadable review.
+                raise ValueError("The latest Mortis baseline could not be restored.") from error
         return False
 
     def save(self, run_id, reports):

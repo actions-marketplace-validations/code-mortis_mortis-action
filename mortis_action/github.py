@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import re
+import time
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
@@ -14,16 +15,32 @@ COMMENT_BODY_LIMIT = 55_000
 FINDING_ID = re.compile(r"finding-[0-9a-f]{32}")
 FINDING_METADATA = "<!-- mortis-action:prior-finding:v1:"
 EVIDENCE_MARKER = re.compile(r"<!-- mortis-action:evidence:v1:([0-9a-f]{64}) -->")
+ANCHOR_ERROR = re.compile(rb"\b(?:diff(?:_hunk)?|path|position|line|side|start_line|start_side)\b", re.IGNORECASE)
 
 
 class GitHubRequestError(ValueError):
-    def __init__(self, method, status):
+    def __init__(self, method, status, *, retry_after=None):
         super().__init__(f"GitHub rejected the Mortis {method} request (HTTP {status}).")
         self.status = status
+        self.retry_after = retry_after
 
 
 class GitHubForbidden(ValueError):
     """GitHub explicitly denied an operation for this token."""
+
+
+def rate_limit_delay(response, message):
+    if response.status not in {403, 429}:
+        return None
+    delay = response.getheader("Retry-After") or ""
+    if delay.isascii() and delay.isdigit():
+        return int(delay)
+    reset = response.getheader("X-RateLimit-Reset") or ""
+    if response.getheader("X-RateLimit-Remaining") == "0" and reset.isascii() and reset.isdigit():
+        return max(0, int(reset) - int(time.time()))
+    if response.status == 429 or "rate limit" in message.lower():
+        return 60
+    return None
 
 
 class GitHubAPI:
@@ -57,18 +74,23 @@ class GitHubAPI:
             )
             response = connection.getresponse()
             body = response.read()
+            if response.status == 204:
+                return None
             if response.status == 404 and allow_missing:
                 return None
-            if response.status == 422 and allow_invalid_anchor:
-                return
+            # GitHub also uses 422 for spam and global review validation. Only split anchor failures.
+            if response.status == 422 and allow_invalid_anchor and ANCHOR_ERROR.search(body):
+                return None
             if not 200 <= response.status < 300:
-                if response.status == 403:
+                if response.status in {403, 429}:
                     try:
                         message = json.loads(body).get("message", "")
                     except (ValueError, AttributeError):
                         message = ""
-                    if isinstance(message, str) and message.startswith("Resource not accessible by "):
+                    message = message if isinstance(message, str) else ""
+                    if message.startswith("Resource not accessible by "):
                         raise GitHubForbidden("GitHub denied this operation for the current token.")
+                    raise GitHubRequestError(method, response.status, retry_after=rate_limit_delay(response, message))
                 raise GitHubRequestError(method, response.status)
             return json.loads(body)
         finally:
@@ -164,6 +186,28 @@ class GitHubAPI:
             variables = {**variables, "after": page["pageInfo"]["endCursor"]}
 
     def resolve_thread(self, thread_id):
+        """Return True for resolved threads, False for discussions, or None for an unreadable thread."""
+        # A maintainer may have replied while the engine was verifying the fix.
+        try:
+            data = self.graphql("""
+                query($id: ID!) {
+                  node(id: $id) {
+                    ... on PullRequestReviewThread { isResolved comments(first: 1) { totalCount } }
+                  }
+                }
+            """, {"id": thread_id})
+        except GitHubForbidden:
+            raise
+        except (ValueError, OSError, http.client.HTTPException):
+            return None
+        thread = data.get("node") or {}
+        if thread.get("isResolved") is True:
+            return True
+        count = (thread.get("comments") or {}).get("totalCount")
+        if thread.get("isResolved") is not False or type(count) is not int or count < 1:
+            return None
+        if count > 1:
+            return False
         data = self.graphql("""
             mutation($id: ID!) {
               resolveReviewThread(input: {threadId: $id}) { thread { isResolved } }
@@ -171,11 +215,13 @@ class GitHubAPI:
         """, {"id": thread_id})
         if not data["resolveReviewThread"]["thread"]["isResolved"]:
             raise ValueError("GitHub did not mark the Mortis thread as resolved.")
+        return True
 
     def pages(self, path):
         page = 1
+        separator = "&" if "?" in path else "?"
         while True:
-            rows = self.request("GET", f"{path}?per_page=100&page={page}")
+            rows = self.request("GET", f"{path}{separator}per_page=100&page={page}")
             yield from rows
             if len(rows) < 100:
                 return

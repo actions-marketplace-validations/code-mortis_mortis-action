@@ -23,6 +23,8 @@ class ReviewWorkflowTests(ActionTestCase):
         self.body_edits = []
         self.questions = []
         self.reviews = []
+        self.check_requests = []
+        self.review_settings = {"model": "fixture", "automatic": True}
         self.skip_unchanged = False
         self.event_file = self.directory / "event.json"
         self.enterContext(patch.dict(os.environ, {
@@ -37,6 +39,9 @@ class ReviewWorkflowTests(ActionTestCase):
         self.enterContext(patch("builtins.print"))
 
     def github_request(self, method, path, data=None, **kwargs):
+        if (method, path) in {("POST", "/check-runs"), ("PATCH", "/check-runs/81")}:
+            self.check_requests.append(data)
+            return {"id": 81}
         if method == "GET":
             if path == "/pulls/42":
                 return dict(self.pr)
@@ -50,9 +55,11 @@ class ReviewWorkflowTests(ActionTestCase):
                 return [{"filename": "app.py", "patch": "@@ -1 +1,2 @@\n context\n+new"}]
             if path.startswith("/pulls/42/comments?"):
                 return self.inline
-        if method == "POST" and path == "/pulls/42/comments":
-            self.inline.append({"id": 3, "user": {"login": github.BOT}, **data})
-            return self.inline[-1]
+        if method == "POST" and path == "/pulls/42/reviews":
+            self.assertEqual((data["event"], data["commit_id"]), ("COMMENT", self.head))
+            for comment in data["comments"]:
+                self.inline.append({"id": len(self.inline) + 3, "user": {"login": github.BOT}, **comment})
+            return {"id": 1}
         if method == "POST" and path == "/issues/42/comments":
             self.summaries.append({"id": 1, "node_id": "summary", "user": {"login": github.BOT}, **data})
             return self.summaries[-1]
@@ -82,7 +89,7 @@ class ReviewWorkflowTests(ActionTestCase):
         result = {}
         if Path(argv[0]).name == "mortis":
             if argv[1] == "config":
-                result = {"review": {"settings": {"model": "fixture", "automatic": True}}}
+                result = {"review": {"settings": self.review_settings}}
             elif argv[1] == "review":
                 self.reviews.append(argv)
                 skipped = self.skip_unchanged and "--no-skip-unchanged" not in argv
@@ -150,3 +157,89 @@ class ReviewWorkflowTests(ActionTestCase):
     def test_disabled_features_do_not_ask_or_edit_description(self):
         self.trigger("opened")
         self.assertEqual((self.questions, self.body_edits), ([], []))
+
+    def finish(self):
+        values = dict(line.split("=", 1) for line in self.outputs.read_text().splitlines())
+        with patch.dict(os.environ, {
+            "MORTIS_EXIT_CODE": values["exit-code"], "MORTIS_RUN_STATUS": values["status"],
+            "MORTIS_PR_NUMBER": values["pr-number"], "MORTIS_PR_BASE": values["pr-base"],
+            "MORTIS_PR_HEAD": values["pr-head"], "MORTIS_CHECK_ID": values["check-id"],
+            "MORTIS_REPORT_JSON": values["report-json"], "MORTIS_HISTORY_UNAVAILABLE": values.get("history-unavailable", ""),
+        }):
+            return run_mortis.finish_action()
+
+    def test_head_check_blocks_a_completed_review_at_finalization(self):
+        with patch.dict(os.environ, {"MORTIS_FAIL_ON_SEVERITY": "high", "GITHUB_JOB": "review", "GITHUB_RUN_ATTEMPT": "1"}):
+            self.trigger("opened")
+            self.assertEqual(self.finish(), 1)
+        started, finished = self.check_requests
+        self.assertEqual((started["status"], started["head_sha"]), ("in_progress", self.head))
+        self.assertEqual((finished["status"], finished["conclusion"]), ("completed", "failure"))
+        self.assertIn("1 high", finished["output"]["summary"])
+        self.assertIn("policy-result=blocked", self.outputs.read_text())
+
+    def test_maintainer_can_satisfy_the_required_check_on_a_dependabot_pr(self):
+        self.pr["user"] = {"login": "dependabot[bot]", "type": "Bot"}
+        self.review_settings.update(automatic=False, include_bot_prs=False)
+        with patch.dict(os.environ, {"MORTIS_FAIL_ON_SEVERITY": "critical", "GITHUB_JOB": "review", "GITHUB_RUN_ATTEMPT": "1"}):
+            self.trigger("created", full=True)
+            self.assertEqual(self.finish(), 0)
+        started, finished = self.check_requests
+        self.assertEqual((started["name"], started["head_sha"]), ("Mortis Review (critical) / main", self.head))
+        self.assertEqual(finished["conclusion"], "success")
+        self.assertIn("policy-result=passed", self.outputs.read_text())
+
+    def test_unreadable_history_preserves_the_baseline_and_only_blocks_enforced_checks(self):
+        self.review_settings["incremental"] = True
+        with (
+            patch.object(run_mortis.baseline, "ReviewBaseline", autospec=True) as baseline,
+            patch.dict(os.environ, {"GITHUB_JOB": "review", "GITHUB_RUN_ATTEMPT": "1", "MORTIS_PUBLISH_CHECK": "true"}),
+        ):
+            checkpoint = baseline.return_value
+            checkpoint.name = "baseline"
+            checkpoint.save.return_value = self.reports / "baseline.enc"
+            for threshold, restore, policy in (("critical", TimeoutError(), "unevaluated"),
+                                              ("none", TimeoutError(), "advisory"), ("critical", False, "passed")):
+                with self.subTest(policy=policy), patch.dict(os.environ, {"MORTIS_FAIL_ON_SEVERITY": threshold}):
+                    self.outputs.write_text("")
+                    checkpoint.restore.side_effect = [restore]
+                    self.trigger("synchronize")
+                    self.assertEqual(self.finish(), int(policy == "unevaluated"))
+                    self.assertIn(f"policy-result={policy}", self.outputs.read_text())
+                    self.assertEqual("baseline-path=" in self.outputs.read_text(), policy == "passed")
+                    if policy == "unevaluated":
+                        self.assertEqual(self.check_requests[-1]["conclusion"], "failure")
+                        self.assertIn("Earlier open findings", self.check_requests[-1]["output"]["summary"])
+            checkpoint.save.assert_called_once()
+
+    def test_job_keeps_linked_overflow_when_pr_moves_after_summary_write(self):
+        def review_with_overflow(argv, **kwargs):
+            result = self.engine(argv, **kwargs)
+            if Path(argv[0]).name == "mortis" and argv[1] == "review":
+                path = Path(argv[-3])
+                report = json.loads(path.read_text())
+                report["findings"] = [
+                    {"severity": "high", "path": "summary.py", "start_line": i + 1, "end_line": i + 1,
+                     "content": f"Finding {i} " + "é" * 370} for i in range(85)
+                ]
+                path.write_text(json.dumps(report))
+            return result
+
+        def move_pr_after_publish(method, path, data=None, **kwargs):
+            result = self.github_request(method, path, data, **kwargs)
+            if method == "POST" and path == "/issues/42/comments":
+                self.pr["head"] = {**self.pr["head"], "sha": "c" * 40}
+            return result
+
+        with (
+            patch.dict(os.environ, {"MORTIS_CHECK_LINKED_ISSUES": "true"}),
+            patch.object(subprocess, "run", side_effect=review_with_overflow),
+            patch.object(github.GitHubAPI, "request", side_effect=move_pr_after_publish),
+        ):
+            summary = self.trigger("opened")
+        self.assertIn("workflow run summary", summary)
+        self.assertNotIn("Finding 84 ", summary)
+        self.assertIn("superseded=true", self.outputs.read_text())
+        job = Path(os.environ["GITHUB_STEP_SUMMARY"]).read_text()
+        self.assertIn("Finding 84 ", job)
+        self.assertIn(f"/blob/{self.head}/summary.py#L85", job)

@@ -31,6 +31,18 @@ inputs:
   check-linked-issues:
     description: Assess requirements from explicitly linked issues using additional provider requests
     default: "false"
+  inline-min-severity:
+    description: "Minimum severity to post inline: low, medium, high, or critical"
+    default: low
+  publish-check:
+    description: Publish a Mortis Review check on the reviewed PR head (requires checks write permission)
+    default: "false"
+  fail-on-severity:
+    description: "Block PR reviews with open findings at or above this severity and enable the check: none, low, medium, high, or critical"
+    default: none
+  retain-scan-findings:
+    description: Retain a sanitized list of scan findings as a seven-day workflow artifact
+    default: "false"
 outputs:
   status:
     description: "Result status: completed, partial, failed, or skipped"
@@ -56,6 +68,12 @@ outputs:
   inline-failed:
     description: Current findings for which inline delivery failed
     value: ${{ steps.mortis.outputs.inline-failed }}
+  inline-routed:
+    description: Inline-eligible findings sent to the summary by the severity setting
+    value: ${{ steps.mortis.outputs.inline-routed }}
+  policy-result:
+    description: "PR severity policy result: advisory, passed, blocked, or unevaluated"
+    value: ${{ steps.finish.outputs.policy-result }}
 runs:
   using: composite
   steps:
@@ -78,9 +96,14 @@ runs:
         MORTIS_REVIEW_FORKS: ${{ inputs.review-forks }}
         MORTIS_AUTO_DESCRIBE: ${{ inputs.auto-describe }}
         MORTIS_CHECK_LINKED_ISSUES: ${{ inputs.check-linked-issues }}
+        MORTIS_INLINE_MIN_SEVERITY: ${{ inputs.inline-min-severity }}
+        MORTIS_PUBLISH_CHECK: ${{ inputs.publish-check }}
+        MORTIS_FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+        MORTIS_RETAIN_SCAN_FINDINGS: ${{ inputs.retain-scan-findings }}
         MORTIS_GITHUB_TOKEN: ${{ github.token }}
       run: python -I "$GITHUB_ACTION_PATH/run_mortis.py"
     - name: Save Mortis review history
+      id: history
       if: ${{ steps.mortis.outputs.baseline-path != '' }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
@@ -89,9 +112,32 @@ runs:
         overwrite: true
         compression-level: 0
         if-no-files-found: error
-    - name: Set Mortis exit status
+    - name: Upload Mortis finding index
+      id: finding-index
+      if: ${{ !cancelled() && steps.mortis.outputs.finding-index != '' }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: mortis-findings-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.mortis.outputs.run-id }}
+        path: ${{ steps.mortis.outputs.finding-index }}
+        retention-days: 7
+        if-no-files-found: error
+    - name: Finalize Mortis review and exit status
+      id: finish
+      if: ${{ always() }}
       shell: bash
       working-directory: ${{ runner.temp }}
       env:
         MORTIS_EXIT_CODE: ${{ steps.mortis.outputs.exit-code }}
-      run: exit "${MORTIS_EXIT_CODE:-1}"
+        MORTIS_RUN_STATUS: ${{ steps.mortis.outputs.status }}
+        MORTIS_PR_NUMBER: ${{ steps.mortis.outputs.pr-number }}
+        MORTIS_PR_BASE: ${{ steps.mortis.outputs.pr-base }}
+        MORTIS_PR_HEAD: ${{ steps.mortis.outputs.pr-head }}
+        MORTIS_CHECK_ID: ${{ steps.mortis.outputs.check-id }}
+        MORTIS_REPORT_JSON: ${{ steps.mortis.outputs.report-json }}
+        MORTIS_SUPERSEDED: ${{ steps.mortis.outputs.superseded }}
+        MORTIS_HISTORY_UNAVAILABLE: ${{ steps.mortis.outputs.history-unavailable }}
+        MORTIS_UPLOAD_FAILED: ${{ steps.history.outcome == 'failure' || steps.finding-index.outcome == 'failure' }}
+        MORTIS_CANCELLED: ${{ cancelled() }}
+        MORTIS_FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+        MORTIS_GITHUB_TOKEN: ${{ github.token }}
+      run: python -I "$GITHUB_ACTION_PATH/run_mortis.py" --finish
