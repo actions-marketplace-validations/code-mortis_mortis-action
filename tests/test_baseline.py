@@ -31,6 +31,7 @@ class BaselineTests(ActionTestCase):
         self.repo = self.directory / "source"
         self.repo.mkdir()
         self.git("init", "-qb", "main")
+        self.provider = self.enterContext(patch.object(gateway, "send", side_effect=self.send))
 
     def git(self, *args):
         return subprocess.check_output([
@@ -64,6 +65,24 @@ class BaselineTests(ActionTestCase):
             "workflow_run": {"id": run_id},
         }]}
 
+    async def send(self, connection, credentials, request, **kwargs):
+        content = request.messages[0].content
+        payload = json.loads(content.split("\n\n", 2)[1] if content.startswith("# ") else content)
+        if "narrative" in request.output_schema["properties"]:
+            output = {"narrative": "Fixture summary", "groups": []}
+        else:
+            output = {"task_key": payload["task_key"], "findings": [],
+                      "completed_units": [unit["key"] for unit in payload["assigned_units"]]}
+        return Response(output=output, usage=Usage(total_tokens=3))
+
+    def review(self, checkpoint, base, head):
+        with patch.dict(os.environ, {"XDG_STATE_HOME": checkpoint.env["XDG_STATE_HOME"]}):
+            return review_commits(
+                checkpoint.repo, base=base, head=head,
+                connection={"provider": "custom", "protocol": "openai", "model": "fixture", "options": {}},
+                get_credentials=dict,
+            )
+
     def test_restores_coverage_and_prior_findings_after_a_push(self):
         base = self.commit({
             "mortis.toml": "[review]\nincremental = true\nskip_unchanged = true\n",
@@ -71,27 +90,7 @@ class BaselineTests(ActionTestCase):
         })
         first_head = self.commit({"app.py": "a = 1\n", "other.py": "b = 1\n"})
         first = self.checkpoint("first")
-
-        async def send(connection, credentials, request, **kwargs):
-            content = request.messages[0].content
-            payload = json.loads(content.split("\n\n", 2)[1] if content.startswith("# ") else content)
-            if "narrative" in request.output_schema["properties"]:
-                output = {"narrative": "Fixture summary", "groups": []}
-            else:
-                output = {"task_key": payload["task_key"], "findings": [],
-                          "completed_units": [unit["key"] for unit in payload["assigned_units"]]}
-            return Response(output=output, usage=Usage(total_tokens=3))
-
-        def run(checkpoint, head):
-            with patch.dict(os.environ, {"XDG_STATE_HOME": checkpoint.env["XDG_STATE_HOME"]}):
-                return review_commits(
-                    checkpoint.repo, base=base, head=head,
-                    connection={"provider": "custom", "protocol": "openai", "model": "fixture", "options": {}},
-                    get_credentials=dict,
-                )
-
-        self.enterContext(patch.object(gateway, "send", side_effect=send))
-        original = run(first, first_head)
+        original = self.review(first, base, first_head)
         self.assertEqual(original["comparison"]["reason"], "no_baseline")
         finding = {**review_report()["findings"][0], "id": "finding-" + "1" * 32,
                    "status": "open", "source_sha": first_head}
@@ -109,7 +108,7 @@ class BaselineTests(ActionTestCase):
         second = self.checkpoint("second")
         self.artifact(second, saved)
         self.assertTrue(second.restore(base, second_head))
-        report = run(second, second_head)
+        report = self.review(second, base, second_head)
         self.assertEqual(report["comparison"]["strategy"], "incremental")
         self.assertEqual(report["comparison"]["baseline_run_id"], original["run_id"])
         self.assertEqual([row["path"] for row in report["coverage"]["completed"]], ["other.py"])
@@ -121,7 +120,7 @@ class BaselineTests(ActionTestCase):
         third = self.checkpoint("third")
         self.artifact(third, updated, run_id=124)
         self.assertTrue(third.restore(base, second_head))
-        skipped = run(third, second_head)
+        skipped = self.review(third, base, second_head)
         self.assertEqual(skipped["comparison"]["strategy"], "skipped_unchanged")
         self.assertEqual(skipped["usage"]["requests"], [])
         self.assertEqual([row["id"] for row in skipped["history"]], [finding["id"]])
@@ -134,6 +133,30 @@ class BaselineTests(ActionTestCase):
                     other.restore(base, second_head)
                 with patch.dict(os.environ, {"XDG_STATE_HOME": other.env["XDG_STATE_HOME"]}), History(other.repo) as history:
                     self.assertEqual(history.list(), [])
+
+    def test_restores_affected_caller_coverage_for_an_identical_tree(self):
+        base = self.commit({
+            "mortis.toml": "[review]\nskip_unchanged = true\n",
+            "app.py": "import subprocess\nsubprocess.run(['sh', './legacy.sh'], check=True)\n",
+            "legacy.sh": "#!/bin/sh\necho legacy\n",
+        })
+        (self.repo / "legacy.sh").unlink()
+        head = self.commit({})
+        first = self.checkpoint("first")
+        original = self.review(first, base, head)
+        self.assertEqual(original["affected_callers"]["status"], "completed")
+        self.assertEqual([site["path"] for site in original["affected_callers"]["sites"]], ["app.py"])
+        saved = first.save(original["run_id"], self.reports).read_bytes()
+
+        second = self.checkpoint("second")
+        self.artifact(second, saved)
+        self.assertTrue(second.restore(base, head))
+        self.provider.reset_mock()
+        skipped = self.review(second, base, head)
+        self.provider.assert_not_called()
+        self.assertEqual(skipped["comparison"]["strategy"], "skipped_unchanged")
+        self.assertEqual(skipped["affected_callers"]["status"], "reused")
+        self.assertEqual(skipped["units"], [{**unit, "status": "reused"} for unit in original["units"]])
 
     def test_download_never_redirects_the_github_token(self):
         api = github.GitHubAPI("owner/repo", 42)

@@ -104,6 +104,8 @@ def main():
                     "schema_version", "base_sha", "head_sha", "status", "workflow_status", "coverage",
                     "errors", "stage_errors", "settings", "findings", "history", "candidates",
                 )}
+                if "affected_callers" in report:
+                    retained.update(affected_callers=report["affected_callers"], units=report["units"])
                 plan = {"comparison": json.loads(row["plan"])["comparison"]}
                 payload = encode([run_id, row["started"], plan, retained]).encode()
                 nonce = os.urandom(12)
@@ -118,7 +120,7 @@ def main():
                 run_id, started, plan, report = json.loads(cipher.decrypt(data[:12], data[12:], associated_data))
                 if report["schema_version"] != "mortis.review/v1":
                     raise ValueError("Unsupported baseline report.")
-                # Engine 0.1.5 scopes SHA-pinned reviews to their Git arguments. The artifact scopes
+                # Engine scopes SHA-pinned reviews to their Git arguments. The artifact scopes
                 # this row to the PR, and Engine checks the original base, policy and ancestry on reuse.
                 with history.db:
                     history.db.execute(
