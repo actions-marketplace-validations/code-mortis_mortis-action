@@ -1,7 +1,7 @@
 name: Mortis PR review
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
   issue_comment:
     types: [created]
 
@@ -9,18 +9,29 @@ permissions: {}
 
 jobs:
   review:
-    if: ${{ github.event.sender.type != 'Bot' }}
+    # Coarse event filter before allocating a runner. The Action parses commands
+    # exactly and checks the caller's current repository permission.
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       !github.event.pull_request.draft &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.event.sender.login != 'dependabot[bot]' &&
+       (github.event.action != 'edited' || github.event.changes.base)) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       github.event.comment.user.type == 'User' && contains(github.event.comment.body, '/mortis '))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       actions: read
       contents: read
       pull-requests: write
+      # Enable with check-linked-issues.
+      # issues: read
     concurrency:
       group: mortis-review-${{ github.event.pull_request.number || github.event.issue.number }}
       queue: max
     steps:
-      - uses: code-mortis/mortis-action@0c7188bc2532fa80b34f3e781418186a39ce4f48 # v0.2.1
+      - uses: code-mortis/mortis-action@8958be81830c059c680bc293cdbf6724090b5f03 # v0.2.3
         id: mortis
         with:
           provider: opencode-go
@@ -28,6 +39,9 @@ jobs:
           base-url: https://opencode.ai/zen/go/v1
           model: ${{ vars.MORTIS_MODEL }}
           review-forks: ${{ vars.MORTIS_REVIEW_FORKS }}
+          # auto-describe: "true"
+          # Check up to six requirements with the configured provider.
+          # check-linked-issues: "true"
         env:
           MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
           MORTIS_STATE_KEY: ${{ secrets.MORTIS_STATE_KEY }}

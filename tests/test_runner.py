@@ -119,7 +119,9 @@ class RunnerTests(ActionTestCase):
                 "commit": "a" * 40,
                 "coverage": {"completed_files": 1, "selected_files": 3},
                 "findings": [],
-                "problems": ["Dependency inventory timed out. Token test.token"],
+                "stages": {"trivy": {"status": "partial"}},
+                "problems": ["Dependency inventory timed out. Token test.token",
+                             "Fix verification remains uncertain for a private finding title."],
             }
         )
 
@@ -144,7 +146,11 @@ class RunnerTests(ActionTestCase):
                 return subprocess.CompletedProcess(argv, 0, "--prior-findings" if threads else "", "")
             if threads:
                 prior_file = Path(argv[argv.index("--prior-findings") + 1])
-                self.assertEqual(json.loads(prior_file.read_text()), list(threads.values()))
+                prior = json.loads(prior_file.read_text())
+                self.assertEqual([item["id"] for item in prior], [item["id"] for item in threads.values()])
+                for item in prior:
+                    self.assertNotIn("github_anchor", item)
+                    self.assertNotIn("evidence_digest", item)
             Path(argv[-3]).write_text(json.dumps(report))
             Path(argv[-1]).write_text("# Report")
             return subprocess.CompletedProcess(argv, 2, "", "")
@@ -152,7 +158,7 @@ class RunnerTests(ActionTestCase):
         with (
             patch.object(subprocess, "run", side_effect=process),
             patch.object(scanner, "install_trivy") as trivy,
-            patch.object(review, "publish", return_value=True),
+            patch.object(review, "publish", return_value=review.Delivery()),
             patch.object(github.GitHubAPI, "finding_threads", return_value=threads) as list_threads,
             patch.object(repository, "resolve", return_value="a" * 40),
         ):
@@ -162,8 +168,9 @@ class RunnerTests(ActionTestCase):
         return result, calls, trivy
 
     def test_review_supplies_previous_findings_to_the_engine(self):
-        previous = {"id": "finding-" + "1" * 32, "source_sha": "a" * 40}
-        pr = pr_event()["pull_request"]
+        previous = {"id": "finding-" + "1" * 32, "source_sha": "a" * 40,
+                    "github_anchor": ("app.py", 1, 1), "evidence_digest": "f" * 64}
+        pr = pr_event("a" * 40, "b" * 40)["pull_request"]
         settings = {"automatic": True, "include_bot_prs": False, "auto_resolve": True, "model": ""}
         result, calls, _ = self.run_mock("review", settings, pr, threads={"thread": previous})
         self.assertEqual(result[:2], (2, "partial"))
@@ -171,7 +178,7 @@ class RunnerTests(ActionTestCase):
         result, calls, _ = self.run_mock("review", settings, pr)
         self.assertEqual(result[:2], (2, "partial"))
         self.assertNotIn("--prior-findings", calls[-1])
-        self.assertIn("does not support PR finding verification", result[2])
+        self.assertIn("No saved review history was loaded to recheck earlier findings", result[2])
 
     def test_pr_review_restores_and_stages_encrypted_history_on_partial_results(self):
         pr = pr_event("a" * 40, "b" * 40)["pull_request"]
@@ -195,12 +202,15 @@ class RunnerTests(ActionTestCase):
 
     def test_incremental_without_a_key_still_reviews_the_pr(self):
         pr = pr_event("a" * 40, "b" * 40)["pull_request"]
-        settings = {"automatic": True, "include_bot_prs": False, "incremental": True, "model": ""}
+        settings = {"automatic": True, "include_bot_prs": False, "incremental": True, "auto_resolve": True, "model": ""}
         with patch.dict(os.environ, {"MORTIS_STATE_KEY": ""}):
             result, calls, _ = self.run_mock("review", settings, pr)
 
         self.assertEqual(result[:2], (2, "partial"))
         self.assertIn("Set MORTIS_STATE_KEY", result[2])
+        self.assertIn("This review ran without saved history", result[2])
+        self.assertNotIn("does not support PR finding verification", result[2])
+        self.assertNotIn("No saved review history was loaded", result[2])
         self.assertFalse(any("cryptography==50.0.2" in call for call in calls))
         self.assertNotIn("baseline-path=", self.outputs.read_text())
 
@@ -219,16 +229,26 @@ class RunnerTests(ActionTestCase):
 
     def test_manual_reviews_work_with_automatic_reviews_disabled(self):
         result, _, _ = self.run_mock(
-            "review", {"automatic": False, "model": ""}, pr_event(fork=True)["pull_request"], manual=True
+            "review", {"automatic": False, "model": ""}, pr_event("a" * 40, "b" * 40, fork=True)["pull_request"], manual=True
         )
         self.assertEqual(result[:2], (2, "partial"))
+
+    def test_manual_dependabot_review_can_run_with_bot_reviews_disabled(self):
+        settings = {"automatic": False, "include_bot_prs": False, "model": ""}
+        for login, expected in (("dependabot[bot]", (2, "partial")), ("another[bot]", (0, "skipped"))):
+            with self.subTest(login=login):
+                pr = pr_event("a" * 40, "b" * 40, login=login, author_type="Bot")["pull_request"]
+                result, calls, _ = self.run_mock("review", settings, pr, manual=True)
+                self.assertEqual(result[:2], expected)
+                self.assertEqual(any("connect" in call for call in calls), login == "dependabot[bot]")
 
     def test_partial_scan_preserves_outputs_and_uses_configured_model(self):
         with patch.dict(os.environ, {"MORTIS_GITHUB_TOKEN": "test.token"}):
             result, calls, trivy = self.run_mock("scan", {"model": "committed-model"})
         self.assertEqual(result[:2], (2, "partial"))
         self.assertIn("1/3 files covered", result[2])
-        self.assertIn("Dependency inventory timed out", result[2])
+        self.assertIn("Incomplete scan stages: trivy", result[2])
+        self.assertNotIn("private finding title", result[2])
         self.assertNotIn("test&#46;token", result[2])
         trivy.assert_called_once()
         connect = next(call for call in calls if "connect" in call)
@@ -236,6 +256,16 @@ class RunnerTests(ActionTestCase):
         self.assertIn("run-id=scan-1", self.outputs.read_text())
         self.assertIn(f"report-json={self.reports / 'report.json'}", self.outputs.read_text())
         self.assertIn(f"report-markdown={self.reports / 'report.md'}", self.outputs.read_text())
+        self.assertNotIn("finding-index=", self.outputs.read_text())
+
+    def test_opt_in_scan_index_is_staged_even_for_a_partial_result(self):
+        with patch.dict(os.environ, {"MORTIS_RETAIN_SCAN_FINDINGS": "true"}):
+            result, _, _ = self.run_mock("scan", {"model": "scan-model"})
+        self.assertEqual(result[:2], (2, "partial"))
+        emitted = dict(line.split("=", 1) for line in self.outputs.read_text().splitlines())
+        index = Path(emitted["finding-index"])
+        self.assertIn("Scan findings (0)", index.read_text())
+        self.assertNotIn("Dependency inventory timed out", index.read_text())
 
     def test_review_uses_fallback_model_without_installing_trivy(self):
         result, calls, trivy = self.run_mock("review", {"model": ""})
@@ -272,7 +302,7 @@ class RunnerTests(ActionTestCase):
             "GITHUB_WORKSPACE": str(self.directory),
             "MORTIS_COMMAND": "scan",
         }
-        def engine(args, repo, revision, pr, reports, directory, *, manual, request):
+        def engine(args, repo, revision, pr, reports, directory, *, manual, request, auto_describe):
             for name, filename in (("report-json", "report.json"), ("report-markdown", "report.md")):
                 path = reports / filename
                 path.write_text("Partial report")

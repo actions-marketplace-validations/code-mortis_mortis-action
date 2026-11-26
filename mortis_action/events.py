@@ -15,6 +15,8 @@ def select_run(command, event_name, event, repo):
         raise ValueError("Set command to review or scan.")
     pr = event["pull_request"] if event_name == "pull_request" else None
     if pr:
+        if command == "review" and event.get("action") == "edited" and not event.get("changes", {}).get("base"):
+            return None, "The pull request base was not changed"
         if pr["head"]["repo"] is None or pr["head"]["repo"]["full_name"] != pr["base"]["repo"]["full_name"]:
             return None, "Fork pull request"
         if pr["draft"]:
@@ -41,12 +43,16 @@ def comment_command(event_name, event):
         return None
     if not inline and not event.get("issue", {}).get("pull_request"):
         return None
-    body = comment.get("body", "")
+    body = comment.get("body", "").strip()
     if not inline and body == "/mortis review":
         return "review", None
-    if not inline and body.strip() == "/mortis describe":
+    if not inline and body == "/mortis review --full":
+        return "review", "full"
+    if not inline and body == "/mortis preview":
+        return "preview", None
+    if not inline and body == "/mortis describe":
         return "describe", None
-    if match := re.fullmatch(r"/mortis ask\s+(\S.*)", body.strip(), re.DOTALL):
+    if match := re.fullmatch(r"/mortis ask\s+(\S.*)", body, re.DOTALL):
         return "ask", match[1]
     return None
 
@@ -55,8 +61,10 @@ def remote_pull_request(event_name, event):
     repository = os.environ["GITHUB_REPOSITORY"]
     manual = event_name in COMMENT_EVENTS
     inline = event_name == "pull_request_review_comment"
+    manual_review = False
     if manual:
-        if not comment_command(event_name, event):
+        command = comment_command(event_name, event)
+        if not command:
             return None, "No Mortis PR command"
         trigger = event["pull_request"] if inline else event["issue"]
         if inline and (trigger["head"]["repo"] or {}).get("full_name") != repository:
@@ -65,7 +73,10 @@ def remote_pull_request(event_name, event):
         author = event["comment"]["user"]
         if not api.can_review(author["login"]):
             return None, "Mortis commands require repository write access"
+        manual_review = command[0] == "review"
     else:
+        if event.get("action") == "edited" and not event.get("changes", {}).get("base"):
+            return None, "The pull request base was not changed"
         trigger = event["pull_request"]
         api = GitHubAPI(repository, trigger["number"])
 
@@ -74,7 +85,7 @@ def remote_pull_request(event_name, event):
         raise ValueError("The pull request targets a different repository.")
     if pr["state"] != "open" or pr["draft"]:
         return None, "Draft or closed pull request"
-    if "dependabot[bot]" in {pr["user"]["login"], event["sender"]["login"]}:
+    if event["sender"]["login"] == "dependabot[bot]" or (pr["user"]["login"] == "dependabot[bot]" and not manual_review):
         return None, "Dependabot pull request"
     if inline and (pr["head"]["repo"] or {}).get("full_name") != repository:
         return None, "Ask about fork PR lines from the conversation using a review comment link"

@@ -16,14 +16,17 @@ if sys.flags.isolated:
 
 from mortis_action import (
     baseline,
+    checks,
     commands,
     events,
     github,
+    linked_issues,
     markdown,
     repository,
     review,
     trivy,
 )
+from mortis_action.markdown import redact_credentials
 
 
 def append(path, message):
@@ -37,23 +40,72 @@ def output(name, value):
     append("GITHUB_OUTPUT", f"{name}={value}")
 
 
-def redact_credentials(message):
-    secrets = (os.environ.get(name, "") for name in ("MORTIS_API_KEY", "MORTIS_GITHUB_TOKEN", "MORTIS_STATE_KEY"))
-    for secret in sorted(filter(None, secrets), key=len, reverse=True):
-        message = message.replace(secret, "[redacted]")
-    return message
+def annotation(level, message):
+    message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", redact_credentials(message))[:2000]
+    message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level}::{message}")
 
 
-def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, request=None):
+def begin_review_feedback(pr):
+    number, base, head = pr["number"], pr["base"]["sha"], pr["head"]["sha"]
+    if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (head, base)):
+        raise ValueError("Invalid PR revisions for Mortis review feedback.")
+    output("pr-number", int(number))
+    output("pr-base", base)
+    output("pr-head", head)
+    minimum_severity = checks.threshold()
+    if minimum_severity != "none" or os.environ.get("MORTIS_PUBLISH_CHECK", "").lower() == "true":
+        api = github.GitHubAPI(os.environ["GITHUB_REPOSITORY"], number)
+        try:
+            check_id = checks.start(api, pr, minimum_severity)
+        except checks.API_ERRORS:
+            annotation("warning", "Could not start the Mortis Review check. Check the workflow's checks: write permission.")
+        else:
+            output("check-id", check_id)
+
+
+def finish_action():
+    code = int(os.environ.get("MORTIS_EXIT_CODE") or 1)
+    upload_failed = os.environ.get("MORTIS_UPLOAD_FAILED") == "true"
+    if upload_failed:
+        annotation("error", "A Mortis artifact upload failed. See the artifact step in the workflow run.")
+        code = code or 1
+    number = os.environ.get("MORTIS_PR_NUMBER")
+    if not number:
+        return code
+    try:
+        policy, failure, summary = checks.finish(
+            github.GitHubAPI(os.environ["GITHUB_REPOSITORY"], number),
+            {"base_sha": os.environ["MORTIS_PR_BASE"], "head_sha": os.environ["MORTIS_PR_HEAD"]},
+            check_id=os.environ.get("MORTIS_CHECK_ID"), threshold=checks.threshold(),
+            status=os.environ.get("MORTIS_RUN_STATUS") or "failed", report_path=os.environ.get("MORTIS_REPORT_JSON"),
+            superseded=os.environ.get("MORTIS_SUPERSEDED") == "true", upload_failed=upload_failed,
+            history_unavailable=os.environ.get("MORTIS_HISTORY_UNAVAILABLE") == "true",
+            cancelled=os.environ.get("MORTIS_CANCELLED") == "true", warn=lambda note: annotation("warning", note),
+        )
+        output("policy-result", policy)
+        if checks.threshold() != "none":
+            append("GITHUB_STEP_SUMMARY", f"### Mortis merge policy · {policy}\n\n{summary}")
+        return code or failure
+    except (ValueError, OSError, http.client.HTTPException) as error:
+        annotation("error", f"Could not finalize Mortis review feedback. {error}")
+        return code or 1
+
+
+def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, request=None, auto_describe=False):
     command = args[0]
     api = github.GitHubAPI(os.environ["GITHUB_REPOSITORY"], pr["number"]) if pr and command != "scan" else None
+    inline_min = os.environ.get("MORTIS_INLINE_MIN_SEVERITY", "low").strip().lower()
+    if api and command == "review" and inline_min not in markdown.SEVERITIES:
+        raise ValueError("Choose low, medium, high or critical for inline-min-severity.")
     reason = None
-    if command == "ask":
-        marker = commands.ask_marker(request)
+    if command in {"ask", "preview"}:
+        marker = commands.reply_marker(command, request)
         comments = f"{api.pull}/comments" if request["inline"] else api.issue
         if any((row.get("user") or {}).get("login") == github.BOT and row["body"].startswith(marker)
                for row in api.pages(comments)):
             return 0, "skipped", "Mortis has already answered this comment."
+    if command == "ask":
         question_args, reason = commands.ask_arguments(api, request, directory)
         if question_args:
             args = [*args, *question_args]
@@ -69,7 +121,7 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     )
     subprocess.run([sys.executable, "-I", "-m", "venv", directory / "venv"], check=True, env=environment)
     bin_dir = directory / "venv/bin"
-    packages = ["mortis-engine==0.1.6"]
+    packages = ["mortis-engine==0.1.7"]
     state_secret = os.environ.get("MORTIS_STATE_KEY", "")
     if pr and command == "review":
         packages.append("PyYAML==6.0.3")
@@ -105,12 +157,18 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     if api:
         if command == "review" and not manual and not settings["automatic"]:
             return 0, "skipped", "Automatic review disabled in mortis.toml"
-        if pr["user"]["type"] == "Bot" and not settings["include_bot_prs"]:
+        manual_dependabot_review = manual and command == "review" and pr["user"]["login"] == "dependabot[bot]"
+        if pr["user"]["type"] == "Bot" and not settings["include_bot_prs"] and not manual_dependabot_review:
             return 0, "skipped", "Bot reviews disabled in mortis.toml"
     if reason:
         report = {"status": "insufficient_context", "message": reason,
                   **{f"{side}_sha": pr[side]["sha"] for side in ("base", "head")}}
         return commands.finish_pr_command(api, pr, request, command, report)
+    if command == "preview":
+        result = mortis("review", *args[1:], "--repo", repo, "--preview", "--format", "json")
+        if result.returncode not in {0, 2}:
+            raise ValueError("Mortis scope preview failed. " + result.stderr.strip())
+        return commands.publish_preview(api, pr, request, json.loads(result.stdout), result.returncode)
     if request and mortis(command, "--help").returncode:
         raise ValueError(f"The pinned Mortis Engine does not support {command}. Install a compatible release.")
 
@@ -153,7 +211,7 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
         if report.get("run_id"):
             output("run-id", report["run_id"])
         return commands.finish_pr_command(api, pr, request, command, report)
-    threads = {}
+    threads = None
     resolution_note = ""
     prior_args = []
     checkpoint = None
@@ -162,19 +220,25 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     if api and (settings.get("incremental") or settings.get("skip_unchanged")):
         try:
             checkpoint = baseline.ReviewBaseline(api, bin_dir / "python", repo, environment, state_secret)
-        except ValueError:
-            state_note = "\n\nSet MORTIS_STATE_KEY to a base64-encoded 32-byte secret to save incremental review history."
-        if checkpoint is not None:
-            try:
-                restored = checkpoint.restore(pr["base"]["sha"], pr["head"]["sha"])
-            except (ValueError, OSError, http.client.HTTPException):
-                state_note = "\n\nReview history could not be restored. Check Actions read permissions and the state key."
+            restored = checkpoint.restore(pr["base"]["sha"], pr["head"]["sha"])
+        except (ValueError, OSError, http.client.HTTPException):
+            checkpoint = None
+            output("history-unavailable", "true")
+            if state_secret.strip():
+                state_note = ("\n\nThis review ran without saved history. Check the original MORTIS_STATE_KEY "
+                              "and Actions read permissions to restore earlier findings.")
+            else:
+                state_note = ("\n\nThis review ran without saved history. Set MORTIS_STATE_KEY to a "
+                              "base64-encoded 32-byte secret to keep findings between runs.")
     if api and settings.get("auto_resolve"):
         if "--prior-findings" in mortis("review", "--help").stdout:
-            threads = api.finding_threads()
+            try:
+                threads = api.finding_threads()
+            except (ValueError, OSError, http.client.HTTPException):
+                resolution_note = "\n\nMortis could not load the GitHub threads for automatic resolution."
             available = {}
             prior = {}
-            for finding in threads.values():
+            for finding in (threads or {}).values():
                 sha = finding["source_sha"]
                 if sha not in available:
                     try:
@@ -184,7 +248,8 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                     else:
                         available[sha] = True
                 if available[sha]:
-                    prior.setdefault(finding["id"], finding)
+                    engine_fields = ("id", "source_sha", "path", "start_line", "end_line", "severity", "content")
+                    prior.setdefault(finding["id"], {k: finding[k] for k in engine_fields if k in finding})
             if prior:
                 prior_path = directory / "prior-findings.json"
                 prior_path.write_text(json.dumps(list(prior.values())), encoding="utf-8")
@@ -196,8 +261,8 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                 threads = api.finding_threads()
             except (ValueError, OSError, http.client.HTTPException):
                 resolution_note = "\n\nMortis could not load the GitHub threads for automatic resolution."
-        else:
-            resolution_note = "\n\nThe installed Mortis Engine does not support PR finding verification."
+        elif not state_note:
+            resolution_note = "\n\nNo saved review history was loaded to recheck earlier findings."
     report_json = reports / "report.json"
     report_markdown = reports / "report.md"
     result = mortis(
@@ -211,15 +276,54 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     report = json.loads(report_json.read_text())
     output("run-id", report["run_id"])
     status = "partial" if result.returncode == 2 else "failed" if result.returncode else report["status"]
-    url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
-    heading = markdown.summary(report, status, url) + resolution_note + state_note
+    url = checks.run_url()
+    heading = markdown.summary(report, status, url, full_review=manual and "--no-incremental" in args)
+    heading += resolution_note + state_note
+    delivery = review.Delivery()
+    exit_code = result.returncode
+    if command == "scan" and os.environ.get("MORTIS_RETAIN_SCAN_FINDINGS", "").lower() == "true":
+        index = reports / "finding-index.md"
+        index.write_text(markdown.scan_index(report), encoding="utf-8")
+        output("finding-index", index)
     if api:
+        if any(report.get(f"{side}_sha") != pr[side]["sha"] for side in ("base", "head")):
+            raise ValueError("The review report does not match the requested PR revisions.")
+        issue_section = None
+        if (os.environ.get("MORTIS_CHECK_LINKED_ISSUES", "").lower() == "true" and status != "failed"
+                and linked_issues.references(api, pr.get("body"))):
+            def ask(question):
+                path = directory / "issue-question.txt"
+                path.write_text(question, encoding="utf-8")
+                answer = mortis("ask", "--base", report["base_sha"], "--head", report["head_sha"],
+                                "--repo", repo, "--connection", "ci", "--question-file", path, "--format", "json")
+                if answer.returncode:
+                    raise ValueError("Mortis could not assess this requirement.")
+                return json.loads(answer.stdout)
+
+            def issue_section(previous_body):
+                config = {"settings": settings, "connection": connection_args, "engine": packages[0]}
+                return linked_issues.section(api, pr, report, previous_body, config, ask)
+
         try:
-            published = review.publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python", threads=threads)
+            published = review.publish(api, report, heading, repo=repo, workflow_python=bin_dir / "python",
+                                       threads=threads, auto_resolve=settings.get("auto_resolve", False),
+                                       issue_section=issue_section,
+                                       inline_min_severity=inline_min, delivery=delivery)
             if not published:
+                output("superseded", "true")
                 heading += "\n\nThe PR changed during the run. Results apply to the recorded commit."
+            else:
+                for name, count in published.counts.items():
+                    output(name, count)
+                heading += "\n\n" + published.summary
+                for warning in published.warnings:
+                    annotation("warning", warning)
+                if auto_describe and status == "completed" and (note := commands.auto_describe(api, pr, report)):
+                    heading += "\n\n" + note
+                    annotation("warning", note)
         except (ValueError, OSError, http.client.HTTPException) as error:
-            return result.returncode or 1, "failed", f"{heading}\n\nPR publication failed. {error}"
+            heading += f"\n\nPR publication failed. {error}"
+            exit_code, status, published = result.returncode or 1, "failed", None
         if published and checkpoint is not None:
             try:
                 if api.is_current(report):
@@ -228,7 +332,14 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                     output("baseline-path", path)
             except (ValueError, OSError, http.client.HTTPException, subprocess.CalledProcessError):
                 heading += "\n\nMortis could not save the review history for the next run."
-    if status in {"failed", "partial"}:
+    if command == "scan" and status in {"failed", "partial"}:
+        # Engine scan diagnostics can contain finding titles, evidence and paths.
+        stages = report.get("stages", {})
+        incomplete = [name for name in ("snapshot", "trivy", "analysis", "assessment", "verification", "report")
+                      if stages.get(name, {}).get("status") in {"partial", "failed"}]
+        if incomplete:
+            heading += "\n\nIncomplete scan stages: " + ", ".join(incomplete) + "."
+    elif status in {"failed", "partial"}:
         diagnostics = [
             *report.get("problems", []),
             *(f"{row['path']}: {row['message']}" for row in report.get("errors", [])),
@@ -237,7 +348,11 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
         ]
         if diagnostics:
             heading += "\n\n" + markdown.safe_text(redact_credentials(" ".join(dict.fromkeys(diagnostics))), 1400)
-    return result.returncode, status, heading
+    if delivery.overflow:
+        heading, index = markdown.fit_job_index(heading, delivery.overflow, reports)
+        if index:
+            output("finding-index", index)
+    return exit_code, status, heading
 
 
 def main():
@@ -257,24 +372,40 @@ def main():
                     raise ValueError("This event supports only Mortis PR reviews.")
                 pr, reason = events.remote_pull_request(event_name, event)
                 repo = directory / "review.git"
+                if pr and (not manual or events.comment_command(event_name, event)[0] == "review"):
+                    begin_review_feedback(pr)
                 args, revision = repository.fetch_pull_request(repo, pr) if pr else (None, reason)
+                if pr and args is None:
+                    output("superseded", "true")
                 if args and manual:
                     name, question = events.comment_command(event_name, event)
-                    if name != "review":
+                    if name == "review" and question == "full":
+                        args = [*args, "--no-incremental", "--no-skip-unchanged"]
+                    elif name != "review":
                         args = [name, *args[1:]]
                         request = {"question": question, "comment": event["comment"],
                                    "inline": event_name == "pull_request_review_comment"}
             else:
                 pr = event.get("pull_request") if event_name == "pull_request" else None
                 repo = os.environ["GITHUB_WORKSPACE"]
-                args, revision = events.select_run(command, event_name, event, repo)
+                try:
+                    args, revision = events.select_run(command, event_name, event, repo)
+                except (subprocess.CalledProcessError, ValueError):
+                    if pr and command == "review":
+                        begin_review_feedback(pr)
+                    raise
+                if args and pr and command == "review":
+                    begin_review_feedback(pr)
             if args is None:
                 code, status, message = 0, "skipped", revision
             else:
                 # Runner-local outputs must outlive the temporary Engine state.
                 reports = Path(tempfile.mkdtemp(prefix="mortis-reports-", dir=runner_temp))
                 code, status, message = run_engine(
-                    args, repo, revision, pr, reports, directory, manual=manual, request=request
+                    args, repo, revision, pr, reports, directory, manual=manual, request=request,
+                    auto_describe=(os.environ.get("MORTIS_AUTO_DESCRIBE", "").lower() == "true"
+                                   and event_name in {"pull_request", "pull_request_target"}
+                                   and event.get("action") in {"opened", "ready_for_review"}),
                 )
     except subprocess.CalledProcessError as error:
         code, status, message = (
@@ -286,10 +417,7 @@ def main():
         code, status, message = 1, "failed", str(error)
     message = redact_credentials(message)
     if status in {"failed", "partial"}:
-        level = "error" if status == "failed" else "warning"
-        diagnostic = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)[:2000]
-        diagnostic = diagnostic.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print(f"::{level}::{diagnostic}")
+        annotation("error" if status == "failed" else "warning", message)
     else:
         print(f"Mortis action {status}. See the job summary for details.")
     if not message.startswith("## Mortis "):
@@ -300,4 +428,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--finish"]:
+        sys.exit(finish_action())
     main()

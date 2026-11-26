@@ -7,12 +7,12 @@ import os
 import subprocess
 import sys
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
 from urllib.request import HTTPRedirectHandler
 
-from mortis_engine import gateway
+from mortis_engine import cli, config, gateway
 from mortis_engine.history import History, encode
-from mortis_engine.review import review_commits
 from mortis_engine.schemas import Response, Usage
 
 from mortis_action import baseline, github
@@ -75,13 +75,20 @@ class BaselineTests(ActionTestCase):
                       "completed_units": [unit["key"] for unit in payload["assigned_units"]]}
         return Response(output=output, usage=Usage(total_tokens=3))
 
-    def review(self, checkpoint, base, head):
-        with patch.dict(os.environ, {"XDG_STATE_HOME": checkpoint.env["XDG_STATE_HOME"]}):
-            return review_commits(
-                checkpoint.repo, base=base, head=head,
-                connection={"provider": "custom", "protocol": "openai", "model": "fixture", "options": {}},
-                get_credentials=dict,
-            )
+    def review(self, checkpoint, base, head, *flags):
+        job = checkpoint.repo.parent
+        with (
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": str(job / "config"), "XDG_CACHE_HOME": str(job / "cache"),
+                                    "XDG_STATE_HOME": checkpoint.env["XDG_STATE_HOME"]}),
+            redirect_stderr(io.StringIO()) as diagnostics,
+            redirect_stdout(io.StringIO()) as result,
+        ):
+            config.save("ci", {"provider": "openai", "protocol": "openai", "base_url": "https://fixture.invalid/v1",
+                               "model": "fixture", "api_key_env": "MORTIS_API_KEY"}, None)
+            code = cli.main(["review", "--repo", str(checkpoint.repo), "--base", base, "--head", head,
+                             "--connection", "ci", "--format", "json", *flags])
+            self.assertEqual(code, 0, diagnostics.getvalue())
+            return json.loads(result.getvalue())
 
     def test_restores_coverage_and_prior_findings_after_a_push(self):
         base = self.commit({
@@ -125,11 +132,34 @@ class BaselineTests(ActionTestCase):
         self.assertEqual(skipped["usage"]["requests"], [])
         self.assertEqual([row["id"] for row in skipped["history"]], [finding["id"]])
 
+        manual = self.checkpoint("manual")
+        self.artifact(manual, updated, run_id=124)
+        self.assertTrue(manual.restore(base, second_head))
+        self.provider.reset_mock()
+        full = self.review(manual, base, second_head, "--no-incremental", "--no-skip-unchanged")
+        self.assertEqual(full["status"], "completed")
+        self.assertTrue(self.provider.called)
+        self.assertEqual({row["path"] for row in full["coverage"]["completed"]}, {"app.py", "other.py"})
+        self.assertFalse(full["coverage"]["reused"])
+        self.assertEqual([row["snapshot"] for row in full["history"] if row["status"] == "open"], [finding])
+
+        with patch.dict(os.environ, {"GITHUB_RUN_ID": "125"}):
+            refreshed = manual.save(full["run_id"], self.reports).read_bytes()
+        following = self.checkpoint("following")
+        self.artifact(following, refreshed, run_id=125)
+        self.assertTrue(following.restore(base, second_head))
+        self.provider.reset_mock()
+        resumed = self.review(following, base, second_head)
+        self.provider.assert_not_called()
+        self.assertEqual(resumed["comparison"]["strategy"], "skipped_unchanged")
+        self.assertEqual(resumed["comparison"]["baseline_run_id"], full["run_id"])
+        self.assertEqual([row["id"] for row in resumed["history"]], [finding["id"]])
+
         for number, key, run_id in ((43, self.key, 123), (42, self.key, 124), (42, base64.b64encode(b"b" * 32).decode(), 123)):
             with self.subTest(number=number, run_id=run_id, same_key=key == self.key):
                 other = self.checkpoint(f"invalid-{number}-{run_id}-{key[0]}", number, key=key)
                 self.artifact(other, saved, run_id=run_id)
-                with self.assertRaisesRegex(ValueError, "No valid Mortis baseline"):
+                with self.assertRaisesRegex(ValueError, "latest Mortis baseline"):
                     other.restore(base, second_head)
                 with patch.dict(os.environ, {"XDG_STATE_HOME": other.env["XDG_STATE_HOME"]}), History(other.repo) as history:
                     self.assertEqual(history.list(), [])
@@ -177,3 +207,14 @@ class BaselineTests(ActionTestCase):
         checkpoint.api.request.return_value["artifacts"][0]["expired"] = True
         self.assertFalse(checkpoint.restore("a" * 40, "b" * 40))
         checkpoint.api.download_artifact.assert_not_called()
+
+    def test_unreadable_newest_baseline_stops_before_restoring_older_findings(self):
+        self.commit({"app.py": "a = 0\n"})
+        checkpoint = self.checkpoint("unreadable")
+        self.artifact(checkpoint, b"older encrypted review")
+        rows = checkpoint.api.request.return_value["artifacts"]
+        rows.append({**rows[0], "id": 26, "created_at": "2026-11-24T11:00:00Z"})
+        checkpoint.api.download_artifact.side_effect = TimeoutError()
+        with self.assertRaisesRegex(ValueError, "latest Mortis baseline"):
+            checkpoint.restore("a" * 40, "b" * 40)
+        checkpoint.api.download_artifact.assert_called_once_with(26, baseline.MAX_BYTES + 64 * 1024)
