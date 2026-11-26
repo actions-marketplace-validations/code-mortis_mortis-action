@@ -5,8 +5,8 @@ Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons
 ## Review pull requests
 
 1. Copy [the review workflow](.github/workflows/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
-2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset for the bundled workflow](https://pypi.org/project/mortis-engine/0.1.6/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
-3. Pin the action to a reviewed commit SHA. The bundled workflow currently pins v0.2.1, which installs Engine 0.1.6.
+2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset for the bundled workflow](https://pypi.org/project/mortis-engine/0.1.7/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
+3. Pin the action to a reviewed commit SHA. The bundled workflow currently pins v0.2.2, which installs Engine 0.1.7.
 
 Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. Drafts and Dependabot PRs are skipped. Other bot-authored PRs require `include_bot_prs = true`.
 
@@ -72,7 +72,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: code-mortis/mortis-action@0c7188bc2532fa80b34f3e781418186a39ce4f48 # v0.2.1
+      - uses: code-mortis/mortis-action@0b23b10271e428335938db501f0405ef59d853f4 # v0.2.2
         with:
           base: origin/main
           head: ${{ inputs.head }}
@@ -84,7 +84,7 @@ jobs:
 
 ## Scan a revision
 
-The v0.2.1 example below installs a checksum-verified Trivy 0.76.2 on Linux X64 and ARM64. Pass `ref` to select another local revision. The default is the commit that triggered the workflow. Scans in v0.2.0 fail because it installs Trivy 0.76.0, while Engine 0.1.5 requires 0.76.2.
+The v0.2.2 example below installs a checksum-verified Trivy 0.76.2 on Linux X64 and ARM64. Pass `ref` to select another local revision. The default is the commit that triggered the workflow. Scans in v0.2.0 fail because it installs Trivy 0.76.0, while Engine 0.1.5 requires 0.76.2.
 
 ```yaml
 name: Mortis security scan
@@ -102,7 +102,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: code-mortis/mortis-action@0c7188bc2532fa80b34f3e781418186a39ce4f48 # v0.2.1
+      - uses: code-mortis/mortis-action@0b23b10271e428335938db501f0405ef59d853f4 # v0.2.2
         with:
           command: scan
           provider: openai
