@@ -159,7 +159,7 @@ class BaselineTests(ActionTestCase):
             with self.subTest(number=number, run_id=run_id, same_key=key == self.key):
                 other = self.checkpoint(f"invalid-{number}-{run_id}-{key[0]}", number, key=key)
                 self.artifact(other, saved, run_id=run_id)
-                with self.assertRaisesRegex(ValueError, "No valid Mortis baseline"):
+                with self.assertRaisesRegex(ValueError, "latest Mortis baseline"):
                     other.restore(base, second_head)
                 with patch.dict(os.environ, {"XDG_STATE_HOME": other.env["XDG_STATE_HOME"]}), History(other.repo) as history:
                     self.assertEqual(history.list(), [])
@@ -207,3 +207,14 @@ class BaselineTests(ActionTestCase):
         checkpoint.api.request.return_value["artifacts"][0]["expired"] = True
         self.assertFalse(checkpoint.restore("a" * 40, "b" * 40))
         checkpoint.api.download_artifact.assert_not_called()
+
+    def test_unreadable_newest_baseline_stops_before_restoring_older_findings(self):
+        self.commit({"app.py": "a = 0\n"})
+        checkpoint = self.checkpoint("unreadable")
+        self.artifact(checkpoint, b"older encrypted review")
+        rows = checkpoint.api.request.return_value["artifacts"]
+        rows.append({**rows[0], "id": 26, "created_at": "2026-11-24T11:00:00Z"})
+        checkpoint.api.download_artifact.side_effect = TimeoutError()
+        with self.assertRaisesRegex(ValueError, "latest Mortis baseline"):
+            checkpoint.restore("a" * 40, "b" * 40)
+        checkpoint.api.download_artifact.assert_called_once_with(26, baseline.MAX_BYTES + 64 * 1024)

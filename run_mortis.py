@@ -53,11 +53,11 @@ def begin_review_feedback(pr):
     output("pr-number", int(number))
     output("pr-base", base)
     output("pr-head", head)
-    blocking = checks.threshold() != "none"
-    if blocking or os.environ.get("MORTIS_PUBLISH_CHECK", "").lower() == "true":
+    minimum_severity = checks.threshold()
+    if minimum_severity != "none" or os.environ.get("MORTIS_PUBLISH_CHECK", "").lower() == "true":
         api = github.GitHubAPI(os.environ["GITHUB_REPOSITORY"], number)
         try:
-            check_id = checks.start(api, head)
+            check_id = checks.start(api, pr, minimum_severity)
         except checks.API_ERRORS:
             annotation("warning", "Could not start the Mortis Review check. Check the workflow's checks: write permission.")
         else:
@@ -80,6 +80,7 @@ def finish_action():
             check_id=os.environ.get("MORTIS_CHECK_ID"), threshold=checks.threshold(),
             status=os.environ.get("MORTIS_RUN_STATUS") or "failed", report_path=os.environ.get("MORTIS_REPORT_JSON"),
             superseded=os.environ.get("MORTIS_SUPERSEDED") == "true", upload_failed=upload_failed,
+            history_unavailable=os.environ.get("MORTIS_HISTORY_UNAVAILABLE") == "true",
             cancelled=os.environ.get("MORTIS_CANCELLED") == "true", warn=lambda note: annotation("warning", note),
         )
         output("policy-result", policy)
@@ -156,7 +157,8 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     if api:
         if command == "review" and not manual and not settings["automatic"]:
             return 0, "skipped", "Automatic review disabled in mortis.toml"
-        if pr["user"]["type"] == "Bot" and not settings["include_bot_prs"]:
+        manual_dependabot_review = manual and command == "review" and pr["user"]["login"] == "dependabot[bot]"
+        if pr["user"]["type"] == "Bot" and not settings["include_bot_prs"] and not manual_dependabot_review:
             return 0, "skipped", "Bot reviews disabled in mortis.toml"
     if reason:
         report = {"status": "insufficient_context", "message": reason,
@@ -218,13 +220,12 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     if api and (settings.get("incremental") or settings.get("skip_unchanged")):
         try:
             checkpoint = baseline.ReviewBaseline(api, bin_dir / "python", repo, environment, state_secret)
-        except ValueError:
-            state_note = "\n\nSet MORTIS_STATE_KEY to a base64-encoded 32-byte secret to save incremental review history."
-        if checkpoint is not None:
-            try:
-                restored = checkpoint.restore(pr["base"]["sha"], pr["head"]["sha"])
-            except (ValueError, OSError, http.client.HTTPException):
-                state_note = "\n\nReview history could not be restored. Check Actions read permissions and the state key."
+            restored = checkpoint.restore(pr["base"]["sha"], pr["head"]["sha"])
+        except (ValueError, OSError, http.client.HTTPException):
+            checkpoint = None
+            output("history-unavailable", "true")
+            state_note = ("\n\nReview history could not be restored. Set MORTIS_STATE_KEY to the original "
+                          "base64-encoded 32-byte secret and check Actions read permissions.")
     if api and settings.get("auto_resolve"):
         if "--prior-findings" in mortis("review", "--help").stdout:
             try:

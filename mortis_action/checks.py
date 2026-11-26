@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 from .github import BOT, GitHubForbidden, GitHubRequestError
 from .markdown import SEVERITIES
@@ -24,9 +25,12 @@ def threshold():
     return value
 
 
-def start(api, head):
+def start(api, pr, minimum_severity):
+    head = pr["head"]["sha"]
+    name = (f"{NAME} (advisory)" if minimum_severity == "none"
+            else f"{NAME} ({minimum_severity}) / {pr['base']['ref']}")
     identity = f"{os.environ['GITHUB_RUN_ID']}:{os.environ['GITHUB_RUN_ATTEMPT']}:{os.environ['GITHUB_JOB']}:{api.number}"
-    data = {"name": NAME, "head_sha": head, "status": "in_progress", "details_url": run_url(), "external_id": identity}
+    data = {"name": name, "head_sha": head, "status": "in_progress", "details_url": run_url(), "external_id": identity}
     try:
         return int(api.request("POST", "/check-runs", data)["id"])
     except API_ERRORS as error:
@@ -35,7 +39,7 @@ def start(api, head):
         # Recover a check GitHub accepted before the connection was lost.
         page = 1
         while True:
-            query = f"check_name=Mortis%20Review&filter=all&per_page=100&page={page}"
+            query = f"check_name={quote(name, safe='')}&filter=all&per_page=100&page={page}"
             rows = api.request("GET", f"/commits/{head}/check-runs?{query}")["check_runs"]
             for row in rows:
                 if row.get("external_id") == identity and (row.get("app") or {}).get("slug") == "github-actions":
@@ -112,7 +116,8 @@ def failure_notice(api, revisions, failed):
         api.request("POST", api.issue, {"body": body})
 
 
-def finish(api, revisions, *, check_id, threshold, status, report_path, superseded, upload_failed, cancelled, warn):
+def finish(api, revisions, *, check_id, threshold, status, report_path, superseded, upload_failed, cancelled, warn,
+           history_unavailable=False):
     """Finalize after artifact uploads. Only numeric counts and fixed prose go into the check."""
     try:
         current = api.is_current(revisions)
@@ -128,6 +133,9 @@ def finish(api, revisions, *, check_id, threshold, status, report_path, supersed
             conclusion, policy, summary = verdict(report, status, threshold, revisions)
         except (AttributeError, KeyError, TypeError, ValueError, OSError):
             conclusion, policy, summary = "failure", "unevaluated", "Could not read the review result."
+        if threshold != "none" and history_unavailable:
+            conclusion, policy = "failure", "unevaluated"
+            summary += "\n\nEarlier open findings could not be checked. Restore access to the review history and rerun."
         if upload_failed:
             conclusion, policy = "failure", "unevaluated"
             summary += "\n\nAn artifact upload failed. See the workflow run."

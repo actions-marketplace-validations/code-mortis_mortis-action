@@ -329,16 +329,22 @@ def resolve_verified(api, report, threads, delivery):
         and verification["status"] == "completed" and verification["verdict"] == "fixed"
         and verification["head_sha"] == report["head_sha"]
     }
+    unreadable = False
     for thread_id, finding in threads.items():
         if (finding["id"], finding["source_sha"]) in verified:
             if not api.is_current(report):
                 return False
             try:
-                if not api.resolve_thread(thread_id):
+                resolved = api.resolve_thread(thread_id)
+                if resolved is False:
                     delivery.protected_fixes.append(finding)
+                elif resolved is None:
+                    unreadable = True
             except GitHubForbidden:
                 delivery.warnings.append("GitHub denied permission to resolve review threads. Verified fixes remain in the report.")
                 break
+    if unreadable:
+        delivery.warnings.append("Mortis could not verify the reply count for some review threads and left them open.")
     return True
 
 
@@ -431,14 +437,15 @@ def publish(api, report, heading, *, repo=None, workflow_python=None, threads=No
         nonlocal existing
         body = prefix + "\n\n" + delivery.summary
         notice = f" additional finding(s) are indexed in the {destination}."
-        extra_notice = "\n\nLinked-issue assessment omitted to fit the comment." if extra else ""
-        # Reserve bytes for the overflow count, its destination and the optional issues notice.
-        remaining = COMMENT_BODY_LIMIT - len((body + notice + extra_notice).encode()) - 24
-        visible, overflow, omitted = finding_sections(delivery, prior, report["head_sha"], remaining)
+        # Keep the assessment and its reusable cache in the PR comment when findings overflow.
+        remaining = COMMENT_BODY_LIMIT - len((body + notice).encode()) - 24
+        if extra and len(extra.encode()) > remaining:
+            extra = "\n\nLinked-issue assessment omitted to fit the comment."
+        visible, overflow, omitted = finding_sections(delivery, prior, report["head_sha"], remaining - len(extra.encode()))
         body += visible
         if omitted:
             body += f"\n\n{omitted}{notice}"
-        body += extra if len((body + extra).encode()) <= COMMENT_BODY_LIMIT else extra_notice
+        body += extra
         if len(body.encode()) > COMMENT_BODY_LIMIT:
             raise ValueError("The required Mortis PR summary exceeds the comment size limit.")
         for attempt in range(2):

@@ -186,6 +186,7 @@ class GitHubAPI:
             variables = {**variables, "after": page["pageInfo"]["endCursor"]}
 
     def resolve_thread(self, thread_id):
+        """Return True for resolved threads, False for discussions, or None for an unreadable thread."""
         # A maintainer may have replied while the engine was verifying the fix.
         try:
             data = self.graphql("""
@@ -195,13 +196,17 @@ class GitHubAPI:
                   }
                 }
             """, {"id": thread_id})
+        except GitHubForbidden:
+            raise
         except (ValueError, OSError, http.client.HTTPException):
-            return False
+            return None
         thread = data.get("node") or {}
         if thread.get("isResolved") is True:
             return True
         count = (thread.get("comments") or {}).get("totalCount")
-        if thread.get("isResolved") is not False or type(count) is not int or count != 1:
+        if thread.get("isResolved") is not False or type(count) is not int or count < 1:
+            return None
+        if count > 1:
             return False
         data = self.graphql("""
             mutation($id: ID!) {

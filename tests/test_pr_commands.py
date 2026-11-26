@@ -6,12 +6,20 @@ import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import yaml
+
 import run_mortis
 from mortis_action import commands, events, github, markdown, repository
 from tests.helpers import ActionTestCase, comment_event, pr_event, review_report
 
 
 class PullRequestTests(ActionTestCase):
+    def test_bundled_workflow_uses_trusted_triggers_for_pr_commands(self):
+        path = Path(__file__).resolve().parents[1] / ".github/workflows/mortis-review.yml"
+        triggers = yaml.load(path.read_text(), Loader=yaml.BaseLoader)["on"]
+        self.assertEqual(triggers["issue_comment"]["types"], ["created"])
+        self.assertNotIn("pull_request_review_comment", triggers)
+
     def test_retargets_review_new_base_and_other_edits_skip_before_api_calls(self):
         event = {**pr_event(), "action": "edited", "changes": {"body": {"from": "old body"}}}
         with patch.object(github.GitHubAPI, "request", return_value=event["pull_request"]) as request:
@@ -138,6 +146,20 @@ class PullRequestTests(ActionTestCase):
                 request.return_value = {**pr, "head": {**pr["head"], "sha": "new-head"}}
                 self.assertIsNone(events.remote_pull_request("pull_request_target", event)[0])
 
+    def test_dependabot_reviews_require_a_write_authorized_manual_review_command(self):
+        event = pr_event(login="dependabot[bot]", author_type="Bot")
+        pr = event["pull_request"]
+        with patch.object(github.GitHubAPI, "request") as request:
+            for body in ("/mortis review", "/mortis review --full", "/mortis ask Why?", "/mortis preview", "/mortis describe"):
+                with self.subTest(body=body):
+                    request.side_effect = [{"permission": "write"}, pr]
+                    selected, _ = events.remote_pull_request("issue_comment", comment_event(body))
+                    self.assertEqual(selected, pr if body.startswith("/mortis review") else None)
+            request.side_effect = [{"permission": "read"}]
+            self.assertIsNone(events.remote_pull_request("issue_comment", comment_event())[0])
+            request.side_effect = [pr]
+            self.assertIsNone(events.remote_pull_request("pull_request_target", event)[0])
+
     def test_inline_and_linked_ask_use_the_same_current_diff_anchor(self):
         api = github.GitHubAPI("owner/repo", 42)
         anchor = {"pull_request_url": "https://api.github.com/repos/owner/repo/pulls/42",
@@ -193,7 +215,10 @@ class PullRequestTests(ActionTestCase):
             self.assertEqual(commands.question_with_history(api, {"inline": True, "comment": current}, root, question),
                              question)
         with patch.object(api, "request", side_effect=TimeoutError):
-            self.assertEqual(commands.question_with_history(api, {"inline": True, "comment": current}, root, "Why?"), "Why?")
+            text = commands.question_with_history(api, {"inline": True, "comment": current}, root, "Why?")
+            self.assertIn('"Why is this check needed?"', text)
+            self.assertNotIn("machine metadata", text)
+            self.assertTrue(text.endswith("Current question:\nWhy?"))
 
     def test_history_pages_past_unrelated_discussions_and_stops_at_the_root(self):
         api = github.GitHubAPI("owner/repo", 42)
@@ -211,8 +236,11 @@ class PullRequestTests(ActionTestCase):
         self.assertNotIn("Unrelated", text)
         self.assertNotIn("Older", text)
         self.assertTrue(text.endswith("Why?"))
-        with patch.object(api, "request", side_effect=[unrelated, TimeoutError()]):
-            self.assertEqual(commands.question_with_history(api, request, root, "Why?"), "Why?")
+        with patch.object(api, "request", side_effect=[[*unrelated[:-1], reply], TimeoutError()]):
+            text = commands.question_with_history(api, request, root, "Why?")
+        self.assertIn('"First message"\n"Prior answer"', text)
+        self.assertNotIn("Unrelated", text)
+        self.assertTrue(text.endswith("Current question:\nWhy?"))
 
     def test_ask_caps_rendered_comment_bytes_and_preserves_complete_citations(self):
         api = github.GitHubAPI("owner/repo", 42)

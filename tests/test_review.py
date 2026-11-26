@@ -6,7 +6,7 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 
-from mortis_action import github, markdown, review
+from mortis_action import github, linked_issues, markdown, review
 from tests.helpers import review_report
 
 
@@ -156,12 +156,19 @@ class PublicationTests(unittest.TestCase):
     def test_resolution_rechecks_reply_count_and_preserves_discussions(self):
         with patch.dict(os.environ, {"GITHUB_API_URL": "https://api.github.com"}):
             api = github.GitHubAPI("owner/repo", 42)
-        for node in ({"isResolved": False, "comments": {"totalCount": 2}}, {}, None):
+        with patch.object(api, "graphql", return_value={"node": {"isResolved": False, "comments": {"totalCount": 2}}}) as graphql:
+            self.assertIs(api.resolve_thread("thread"), False)
+            self.assertEqual(graphql.call_count, 1)
+        for node in ({}, None, {"isResolved": False, "comments": {"totalCount": 0}}):
             with self.subTest(node=node), patch.object(api, "graphql", return_value={"node": node}) as graphql:
-                self.assertFalse(api.resolve_thread("thread"))
+                self.assertIsNone(api.resolve_thread("thread"))
                 self.assertEqual(graphql.call_count, 1)
         with patch.object(api, "graphql", side_effect=TimeoutError()) as graphql:
-            self.assertFalse(api.resolve_thread("thread"))
+            self.assertIsNone(api.resolve_thread("thread"))
+            self.assertEqual(graphql.call_count, 1)
+        with patch.object(api, "graphql", side_effect=github.GitHubForbidden("denied")) as graphql:
+            with self.assertRaises(github.GitHubForbidden):
+                api.resolve_thread("thread")
             self.assertEqual(graphql.call_count, 1)
         with patch.object(api, "graphql", side_effect=[
             {"node": {"isResolved": False, "comments": {"totalCount": 1}}},
@@ -180,6 +187,12 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(delivery.protected_fixes, [fixed])
         self.assertIn("Verified fixes with open discussions", self.comments[0]["body"])
         self.assertIn("Inline defect", self.comments[0]["body"])
+        self.api.resolve_thread.return_value = None
+        delivery = review.publish(self.api, self.report, "Review", threads={"thread": fixed}, auto_resolve=True)
+        self.assertFalse(delivery.protected_fixes)
+        self.assertNotIn("Verified fixes with open discussions", self.comments[0]["body"])
+        self.assertIn("could not verify the reply count", delivery.warnings[0])
+        self.assertIn(delivery.warnings[0], self.comments[0]["body"])
 
     def test_rate_limit_headers_distinguish_denied_requests_and_reset_time(self):
         for status, headers, message, expected in (
@@ -694,6 +707,36 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn(old, self.comments[0]["body"])
         self.assertNotIn("pending refresh", self.comments[0]["body"])
         self.assertEqual(len(self.comments), 1)
+
+    def test_linked_assessment_and_cache_survive_finding_overflow(self):
+        row = self.report["findings"][1]
+        self.report["findings"] = [{**row, "content": f"Finding {i} " + "é" * 380} for i in range(100)]
+        issue_api = Mock(owner="owner")
+        issue_api.name = "repo"
+        pr = {side: {"sha": self.report[f"{side}_sha"]} for side in ("base", "head")}
+        pr["body"] = "Closes #42"
+        issue_api.current.return_value = pr
+        issue_api.request.return_value = {"number": 42, "title": "Validation", "body": "- [ ] Reject duplicates"}
+        ask = Mock(return_value={"schema_version": "mortis.ask/v1", "status": "completed",
+                   "base_sha": self.report["base_sha"], "head_sha": self.report["head_sha"],
+                   "result": {"answer": "Assessment evidence " * 22, "citations": [
+                       {"sha": self.report["head_sha"], "path": "app.py", "start_line": 1, "end_line": 1}]}})
+
+        def refresh(previous):
+            if previous:
+                self.assertIn("pending refresh", self.comments[0]["body"])
+                self.assertRegex(self.comments[0]["body"], linked_issues.CACHE)
+            return linked_issues.section(issue_api, pr, self.report, previous, {}, ask)
+
+        with patch.dict(os.environ, {"GITHUB_SERVER_URL": "https://github.example"}):
+            for _ in range(2):
+                delivery = review.publish(self.api, self.report, "Review", issue_section=refresh)
+                body = self.comments[0]["body"]
+                self.assertIn("Assessment evidence", body)
+                self.assertRegex(body, linked_issues.CACHE)
+                self.assertIn("Finding 99", delivery.overflow)
+                self.assertLessEqual(len(body.encode()), github.COMMENT_BODY_LIMIT)
+        ask.assert_called_once()
 
     def test_pending_assessment_omits_rotated_credential_when_refresh_fails(self):
         credential = "fixture#rotated"

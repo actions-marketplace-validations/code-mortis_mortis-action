@@ -135,6 +135,7 @@ runs:
         MORTIS_CHECK_ID: ${{ steps.mortis.outputs.check-id }}
         MORTIS_REPORT_JSON: ${{ steps.mortis.outputs.report-json }}
         MORTIS_SUPERSEDED: ${{ steps.mortis.outputs.superseded }}
+        MORTIS_HISTORY_UNAVAILABLE: ${{ steps.mortis.outputs.history-unavailable }}
         MORTIS_UPLOAD_FAILED: ${{ steps.history.outcome == 'failure' || steps.finding-index.outcome == 'failure' }}
         MORTIS_CANCELLED: ${{ cancelled() }}
         MORTIS_FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}

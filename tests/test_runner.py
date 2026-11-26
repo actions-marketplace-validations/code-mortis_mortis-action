@@ -230,6 +230,15 @@ class RunnerTests(ActionTestCase):
         )
         self.assertEqual(result[:2], (2, "partial"))
 
+    def test_manual_dependabot_review_can_run_with_bot_reviews_disabled(self):
+        settings = {"automatic": False, "include_bot_prs": False, "model": ""}
+        for login, expected in (("dependabot[bot]", (2, "partial")), ("another[bot]", (0, "skipped"))):
+            with self.subTest(login=login):
+                pr = pr_event("a" * 40, "b" * 40, login=login, author_type="Bot")["pull_request"]
+                result, calls, _ = self.run_mock("review", settings, pr, manual=True)
+                self.assertEqual(result[:2], expected)
+                self.assertEqual(any("connect" in call for call in calls), login == "dependabot[bot]")
+
     def test_partial_scan_preserves_outputs_and_uses_configured_model(self):
         with patch.dict(os.environ, {"MORTIS_GITHUB_TOKEN": "test.token"}):
             result, calls, trivy = self.run_mock("scan", {"model": "committed-model"})

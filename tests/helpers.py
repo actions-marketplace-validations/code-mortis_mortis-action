@@ -16,7 +16,7 @@ def pr_event(base="base", head="head", *, draft=False, fork=False, login="contri
             "state": "open",
             "draft": draft,
             "user": {"login": login, "type": author_type},
-            "base": {"sha": base, "repo": {"full_name": "owner/repo"}},
+            "base": {"ref": "main", "sha": base, "repo": {"full_name": "owner/repo"}},
             "head": {"sha": head, "repo": {"full_name": "user/fork" if fork else "owner/repo"}},
         },
     }

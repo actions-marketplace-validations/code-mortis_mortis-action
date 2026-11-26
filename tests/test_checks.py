@@ -3,6 +3,7 @@
 import json
 import os
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlsplit
 
 import run_mortis
 from mortis_action import checks, github
@@ -39,12 +40,35 @@ class CheckTests(ActionTestCase):
             TimeoutError(),
             {"check_runs": [{"id": 7, "app": {"slug": "github-actions"}, "external_id": "123:2:review:42"}]},
         ]
+        pr = pr_event(self.base, self.head)["pull_request"]
+        pr["base"]["ref"] = "release/1.7+hotfix"
         with patch.dict(os.environ, {"MORTIS_FAIL_ON_SEVERITY": "high"}), patch.object(github, "GitHubAPI", return_value=self.api):
-            run_mortis.begin_review_feedback(pr_event(self.base, self.head)["pull_request"])
+            run_mortis.begin_review_feedback(pr)
         request = self.api.request.call_args_list[0]
         self.assertEqual(request.args[:2], ("POST", "/check-runs"))
         self.assertEqual((request.args[2]["head_sha"], request.args[2]["status"]), (self.head, "in_progress"))
+        name = "Mortis Review (high) / release/1.7+hotfix"
+        self.assertEqual(request.args[2]["name"], name)
+        recovery_query = urlsplit(self.api.request.call_args_list[1].args[1]).query
+        self.assertEqual(parse_qs(recovery_query)["check_name"], [name])
         self.assertIn("check-id=7", self.outputs.read_text())
+
+    def test_same_head_has_distinct_checks_by_target_and_severity(self):
+        pr = pr_event(self.base, self.head)["pull_request"]
+        self.api.request.return_value = {"id": 81}
+        for target, threshold, name in (
+            ("main", "high", "Mortis Review (high) / main"),
+            ("release", "high", "Mortis Review (high) / release"),
+            ("main", "critical", "Mortis Review (critical) / main"),
+            ("main", "none", "Mortis Review (advisory)"),
+        ):
+            with self.subTest(target=target, threshold=threshold), patch.dict(os.environ, {
+                "MORTIS_FAIL_ON_SEVERITY": threshold, "MORTIS_PUBLISH_CHECK": "true",
+            }), patch.object(github, "GitHubAPI", return_value=self.api):
+                pr["base"]["ref"] = target
+                run_mortis.begin_review_feedback(pr)
+                payload = self.api.request.call_args.args[2]
+                self.assertEqual((payload["name"], payload["head_sha"]), (name, self.head))
 
     def test_open_counts_and_unchanged_policy_use_carried_history(self):
         self.assertEqual(checks.report_counts(self.report), {"critical": 0, "high": 1, "medium": 0, "low": 1})

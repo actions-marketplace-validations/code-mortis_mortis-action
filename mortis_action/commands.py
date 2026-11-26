@@ -4,7 +4,6 @@ import http.client
 import json
 import os
 import re
-from itertools import chain
 from urllib.parse import quote
 
 from .github import COMMENT_BODY_LIMIT
@@ -30,28 +29,32 @@ def question_with_history(api, request, anchor, question):
         return question
     root = anchor.get("in_reply_to_id") or anchor_id
     quoted, seen = [], set()
-    try:
-        recent = api.pages(f"{api.pull}/comments?sort=created&direction=desc")
-        for row in chain(recent, (anchor,)):
-            key = row["id"]
-            if row.get("pull_request_url") != anchor["pull_request_url"] or (row.get("in_reply_to_id") or key) != root:
-                continue
-            if key in seen or (request["inline"] and key >= comment["id"]):
-                continue
-            if comment.get("created_at") and row.get("created_at", "") > comment["created_at"]:
-                continue
-            body = re.sub(r"<!--.*?(?:-->|\Z)", "", row.get("body") or "", flags=re.DOTALL).strip()
-            if body:
-                item = json.dumps(redact_credentials(body)[:1000], ensure_ascii=False)
-                if len(item) + 1 > budget:
-                    break
-                quoted.append(item)
-                seen.add(key)
-                budget -= len(item) + 1
-            if key == root or len(quoted) == 6:
+
+    def available_comments():
+        try:
+            yield from api.pages(f"{api.pull}/comments?sort=created&direction=desc")
+        except (ValueError, OSError, http.client.HTTPException):
+            pass  # Keep any comments from earlier pages and the independently fetched anchor.
+        yield anchor
+
+    for row in available_comments():
+        key = row["id"]
+        if row.get("pull_request_url") != anchor["pull_request_url"] or (row.get("in_reply_to_id") or key) != root:
+            continue
+        if key in seen or (request["inline"] and key >= comment["id"]):
+            continue
+        if comment.get("created_at") and row.get("created_at", "") > comment["created_at"]:
+            continue
+        body = re.sub(r"<!--.*?(?:-->|\Z)", "", row.get("body") or "", flags=re.DOTALL).strip()
+        if body:
+            item = json.dumps(redact_credentials(body)[:1000], ensure_ascii=False)
+            if len(item) + 1 > budget:
                 break
-    except (ValueError, OSError, http.client.HTTPException):
-        return question
+            quoted.append(item)
+            seen.add(key)
+            budget -= len(item) + 1
+        if key == root or len(quoted) == 6:
+            break
     return prefix + "\n".join(reversed(quoted)) + suffix if quoted else question
 
 
