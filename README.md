@@ -6,7 +6,7 @@ Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons
 
 1. Copy [the review workflow](.github/workflows/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
 2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset for the bundled workflow](https://pypi.org/project/mortis-engine/0.1.7/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
-3. Pin the action to a reviewed commit SHA. The bundled workflow pins the published v0.2.2 release. Features marked v0.2.3 below are part of the release candidate. Both revisions install Engine 0.1.7.
+3. Pin the action to a reviewed commit SHA. The bundled workflow pins v0.2.3, which installs Mortis Engine 0.1.7.
 
 **Public GitHub.com repositories.** Starting December 2, 2026, automatic reviews using `pull_request_target` require an applicable Actions event policy. In your repository or organization's workflow execution protections, allow that event specifically for `.github/workflows/mortis-review.yml`. Policy Insights shows which runs the default rule would block. To keep the default protection, retain the `issue_comment` trigger and have a maintainer post `/mortis review` in the PR conversation. [GitHub announcement](https://github.blog/changelog/2026-11-02-pull_request_target-blocked-by-default-december-2/) · [Workflow execution settings](https://docs.github.com/en/actions/how-tos/administer/control-workflow-execution)
 
@@ -32,7 +32,7 @@ The bundled workflow also reviews changes to the PR's target branch. Ordinary is
 
 ### Automatic descriptions and linked issues
 
-Pin an Action revision containing these inputs before enabling them. The bundled v0.2.2 pin predates both options. Set either input under the Action step's `with` block.
+Set either input under the Action step's `with` block.
 
 | Input | Default | Behavior |
 | --- | --- | --- |
@@ -100,7 +100,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: code-mortis/mortis-action@0b23b10271e428335938db501f0405ef59d853f4 # v0.2.2
+      - uses: code-mortis/mortis-action@8958be81830c059c680bc293cdbf6724090b5f03 # v0.2.3
         with:
           base: origin/main
           head: ${{ inputs.head }}
@@ -112,7 +112,7 @@ jobs:
 
 ## Scan a revision
 
-The v0.2.2 example below installs a checksum-verified Trivy 0.76.2 on Linux X64 and ARM64. Pass `ref` to select another local revision. The default is the commit that triggered the workflow. Scans in v0.2.0 fail because it installs Trivy 0.76.0, while Engine 0.1.5 requires 0.76.2.
+The v0.2.3 example below installs a checksum-verified Trivy 0.76.2 on Linux X64 and ARM64. Pass `ref` to select another local revision. The default is the commit that triggered the workflow. Scans in v0.2.0 fail because it installs Trivy 0.76.0, while Engine 0.1.5 requires 0.76.2.
 
 ```yaml
 name: Mortis security scan
@@ -130,12 +130,11 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: code-mortis/mortis-action@0b23b10271e428335938db501f0405ef59d853f4 # v0.2.2
+      - uses: code-mortis/mortis-action@8958be81830c059c680bc293cdbf6724090b5f03 # v0.2.3
         with:
           command: scan
           provider: openai
           model: ${{ vars.MORTIS_MODEL }}
-          # Enable after updating the Action pin to v0.2.3:
           # retain-scan-findings: "true"
         env:
           MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
