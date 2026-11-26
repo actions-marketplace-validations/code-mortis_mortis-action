@@ -1,6 +1,6 @@
 # Mortis Action
 
-Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. The action installs Mortis Engine 0.1.6 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
+Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. This revision installs Mortis Engine 0.1.6 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
 
 ## Review pull requests
 
@@ -39,7 +39,7 @@ Existing `pull_request` workflows can continue reviewing same-repository PRs wit
 
 ### Incremental pull request reviews
 
-Set `incremental = true` under `[review]` in the target branch's `mortis.toml`. The first run and the first run after an Engine upgrade review the full PR. Subsequent runs can reuse coverage for unchanged files from a compatible, fully covered review. A changed tree with an eligible deletion or rename triggers a full review so the Engine can check affected callers. Set `skip_unchanged = true` to reuse compatible coverage when the head tree is identical. The job summary and PR comment list reviewed and reused files. The PR comment also keeps earlier open findings from the saved history.
+Set `incremental = true` under `[review]` in the target branch's `mortis.toml`. The first run and the first run after an Engine upgrade review the full PR. Subsequent runs can reuse coverage for unchanged files from a compatible, fully covered review. With Engine 0.1.6, a changed tree with an eligible deletion or rename triggers a full review to check surviving callers, including in eligible unchanged files. Set `skip_unchanged = true` to reuse compatible coverage when the head tree is identical, including complete caller coverage. The job summary and PR comment list reviewed and reused files. The PR comment also keeps earlier open findings from the saved history.
 
 Generate a key with `openssl rand -base64 32` and store it as the `MORTIS_STATE_KEY` repository secret. The bundled workflow passes the key to the action and grants `actions: read`. For a custom workflow, add those settings and serialize review jobs per PR using a concurrency group. Use an action revision that includes incremental review support.
 
@@ -68,7 +68,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: code-mortis/mortis-action@main
+      - uses: code-mortis/mortis-action@483f17a82d2187ec23d93d26962a3f08e127362b # v0.2.0
         with:
           base: origin/main
           head: ${{ inputs.head }}
@@ -80,7 +80,7 @@ jobs:
 
 ## Scan a revision
 
-Scan mode installs a checksum-verified Trivy 0.76.2 on Linux X64 and ARM64. Pass `ref` to select another local revision. The default is the commit that triggered the workflow.
+This revision installs a checksum-verified Trivy 0.76.2 on Linux X64 and ARM64. Pass `ref` to select another local revision. The default is the commit that triggered the workflow. Replace `ACTION_COMMIT_SHA` with the full commit SHA of a reviewed Action release that installs Trivy 0.76.2. Scans in v0.2.0 fail because it installs Trivy 0.76.0, while Engine 0.1.5 requires 0.76.2.
 
 ```yaml
 name: Mortis security scan
@@ -98,7 +98,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: code-mortis/mortis-action@main
+      - uses: code-mortis/mortis-action@ACTION_COMMIT_SHA
         with:
           command: scan
           provider: openai
