@@ -278,6 +278,23 @@ class PublicationTests(unittest.TestCase):
         self.assertIn("Inline defect", self.comments[0]["body"])
         self.assertEqual(self.inline, [])
 
+    def test_inline_head_read_timeout_keeps_finding_in_summary(self):
+        self.api.is_current.side_effect = [True, TimeoutError(), True]
+        delivery = review.publish(self.api, self.report, "Review")
+        self.assertEqual(delivery.counts["inline-failed"], 1)
+        self.assertEqual(self.inline, [])
+        self.assertIn("### Findings with failed inline delivery", self.comments[0]["body"])
+        self.assertIn("Inline defect", self.comments[0]["body"])
+
+    def test_thread_read_failure_keeps_confirmed_markers_and_withholds_other_posts(self):
+        review.publish(self.api, self.report, "First")
+        self.api.finding_threads.side_effect = TimeoutError()
+        self.report["findings"].append({**self.report["findings"][0], "content": "Another inline defect"})
+        delivery = review.publish(self.api, self.report, "Second")
+        self.assertEqual(delivery.counts, {"inline-posted": 0, "inline-existing": 1, "summary-only": 1, "inline-failed": 1})
+        self.assertEqual(len(self.inline), 1)
+        self.assertIn("Another inline defect", self.comments[0]["body"])
+
     def test_ambiguous_inline_success_reconciled_without_duplicate_plain_comment(self):
         self.set_suggestion()
         normal = self.api.request.side_effect
@@ -377,6 +394,35 @@ class PublicationTests(unittest.TestCase):
             self.assertNotIn("Old defect", body)
             self.assertEqual(body.count("### Linked issues"), 1)
             first = head
+
+    def test_unchanged_overview_survives_transient_provenance_read_failures(self):
+        self.report.update(findings=[], summary={"result": {"narrative": "Keep the previous overview."}})
+        review.publish(self.api, self.report, "Original review")
+        comment = self.comments[0]
+        comment["node_id"] = "I1"
+        original = comment["body"]
+        self.report.update(comparison={"strategy": "skipped_unchanged"}, summary={"status": "skipped"})
+        with patch.dict(os.environ, {"GITHUB_API_URL": "https://api.github.com"}):
+            api = github.GitHubAPI("owner/repo", 42)
+        self.api.trusted_summary_body.side_effect = api.trusted_summary_body
+        node = {"author": {"login": "github-actions", "__typename": "Bot"}, "editor": None,
+                "lastEditedAt": None, "body": original}
+        self.api.request.reset_mock()
+        with patch.object(api, "graphql", side_effect=[TimeoutError(), TimeoutError(), TimeoutError(), {"node": node}]):
+            with self.assertRaisesRegex(ValueError, "previous review overview"):
+                review.publish(self.api, self.report, "Skipped review")
+            self.api.request.assert_not_called()
+            self.assertEqual(comment["body"], original)
+            review.publish(self.api, self.report, "Recovered review")
+        self.assertIn("Recovered review", comment["body"])
+        self.assertIn("Keep the previous overview", comment["body"])
+
+        self.report.update(comparison={}, summary={"result": {"narrative": "Fresh overview"}})
+        section = Mock(return_value="")
+        with patch.object(api, "graphql", side_effect=TimeoutError()):
+            review.publish(self.api, self.report, "New review", issue_section=section)
+        section.assert_called_once_with("")
+        self.assertIn("Fresh overview", comment["body"])
 
     def test_previous_summary_requires_bot_editor_provenance(self):
         with patch.dict(os.environ, {"GITHUB_API_URL": "https://api.github.com"}):
@@ -487,6 +533,23 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn(old, self.comments[0]["body"])
         self.assertNotIn("pending refresh", self.comments[0]["body"])
         self.assertEqual(len(self.comments), 1)
+
+    def test_pending_assessment_omits_rotated_credential_when_refresh_fails(self):
+        credential = "fixture#rotated"
+        for row in (markdown.safe_text(credential, 100), "[Source](https://example.com/fixture%23rotated.py)"):
+            with self.subTest(row=row):
+                old = "\n\n### Linked issues\n\n- " + row
+                review.publish(self.api, self.report, "First", issue_section=Mock(return_value=old))
+                self.assertIn(old, self.comments[0]["body"])
+                refresh = Mock(side_effect=TimeoutError())
+                with patch.dict(os.environ, {"MORTIS_API_KEY": credential}):
+                    result = review.publish(self.api, self.report, "Second", issue_section=refresh)
+
+                refresh.assert_called_once()
+                self.assertTrue(result.warnings)
+                self.assertIn("Second", self.comments[0]["body"])
+                self.assertNotIn(review.ISSUES_START, self.comments[0]["body"])
+                self.assertNotIn("rotated", self.comments[0]["body"])
 
     def test_same_head_legacy_marker_does_not_suppress_different_evidence(self):
         finding = self.report["findings"][0]

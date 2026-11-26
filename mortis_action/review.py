@@ -16,7 +16,12 @@ from .github import (
     evidence_digest,
     finding_metadata,
 )
-from .markdown import earlier_open_findings, overview, safe_text
+from .markdown import (
+    contains_rendered_credential,
+    earlier_open_findings,
+    overview,
+    safe_text,
+)
 
 SUMMARY_MARKER = "<!-- mortis-action:review -->"
 
@@ -161,7 +166,11 @@ def finding_marker(identity):
 def post_inline(api, report, payload, marker):
     """Reconcile an ambiguous write before a single retry against the same head."""
     for _ in range(2):
-        if not api.is_current(report):
+        try:
+            current = api.is_current(report)
+        except API_ERRORS:
+            return "inline-failed"
+        if not current:
             return "stale"
         try:
             row = api.request("POST", f"{api.pull}/comments", payload, allow_invalid_anchor=True)
@@ -203,7 +212,7 @@ def deliver_inline(api, report, finding, lines, markers, threads, repo, workflow
                 if added and finding["start_line"] <= n <= finding["end_line"]), default=None)
     if line is None:
         return "summary-only"
-    if existing_thread(finding, line, threads):
+    if threads and existing_thread(finding, line, threads):
         return "inline-existing"
     if markers is None:  # GitHub could not confirm which comments have already been posted.
         return "inline-failed"
@@ -212,6 +221,8 @@ def deliver_inline(api, report, finding, lines, markers, threads, repo, workflow
     legacy = markers.get(finding_marker(identity), "")
     if marker in markers or (legacy and len(" ".join(finding["content"].split())) < 400 and finding_text(finding) in legacy):
         return "inline-existing"
+    if threads is None:  # A thread on an earlier head could already represent this finding.
+        return "inline-failed"
     payload = {
         "body": f"{marker}\n{finding_metadata(finding, head)}{finding_text(finding)}",
         "commit_id": head, "path": path, "line": line, "side": "RIGHT",
@@ -268,7 +279,7 @@ ISSUES_END = "<!-- /mortis-action:linked-issues -->"
 def previous_issues(previous):
     _, found, rest = previous.partition(ISSUES_START)
     content, end, _ = rest.partition(ISSUES_END)
-    if not found or not end or len(content.encode()) > 16_384:
+    if not found or not end or len(content.encode()) > 16_384 or contains_rendered_credential(content):
         return ""
     return ("\n\n<details><summary>Previous linked-issue assessment, pending refresh</summary>\n\n"
             + ISSUES_START + content + ISSUES_END + "\n</details>")
@@ -282,9 +293,15 @@ def publish(api, report, heading, *, repo=None, workflow_python=None, threads=No
         if (row.get("user") or {}).get("login") == BOT and (row.get("body") or "").startswith(SUMMARY_MARKER + "\n")
     ), None)
     previous = ""
-    if existing and (issue_section or (report.get("comparison") or {}).get("strategy") == "skipped_unchanged"):
+    unchanged = (report.get("comparison") or {}).get("strategy") == "skipped_unchanged"
+    if existing and (issue_section or unchanged):
         trusted = api.trusted_summary_body(existing)
-        if trusted.startswith(SUMMARY_MARKER + "\n"):
+        if trusted is None and unchanged:
+            # The skipped run has no fresh overview to replace a temporarily unreadable one.
+            trusted = api.trusted_summary_body(existing)
+            if trusted is None:
+                raise ValueError("Could not verify the previous review overview. Retry the run to update the PR summary.")
+        if trusted and trusted.startswith(SUMMARY_MARKER + "\n"):
             previous = trusted
 
     delivery = Delivery()
@@ -301,13 +318,13 @@ def publish(api, report, heading, *, repo=None, workflow_python=None, threads=No
         if diff:
             try:
                 markers = existing_markers(api)
-                if threads is None and markers:
-                    threads = api.finding_threads()
+                if threads is None:
+                    threads = api.finding_threads() if markers else {}
             except API_ERRORS:
-                markers = None
+                pass  # A failed thread lookup leaves the REST markers available.
         for finding in findings:
             lines = None if diff is None else diff.get(finding["path"], {})
-            outcome = deliver_inline(api, report, finding, lines, markers, threads or {}, repo, workflow_python)
+            outcome = deliver_inline(api, report, finding, lines, markers, threads, repo, workflow_python)
             if outcome == "stale":
                 return None
             delivery.counts[outcome] += 1

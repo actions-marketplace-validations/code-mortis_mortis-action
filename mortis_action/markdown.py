@@ -1,7 +1,9 @@
 """Render shared review text, change overviews and workflow summaries."""
 
+import html
 import os
 import re
+from urllib.parse import unquote
 
 
 def redact_credentials(text):
@@ -9,6 +11,12 @@ def redact_credentials(text):
     for secret in sorted(filter(None, values), key=len, reverse=True):
         text = text.replace(secret, "[redacted]")
     return text
+
+
+def contains_rendered_credential(markdown):
+    # Labels use HTML entities and citation URLs use percent-encoded paths.
+    visible = html.unescape(markdown)
+    return any(redact_credentials(text) != text for text in (markdown, visible, unquote(visible)))
 
 
 def safe_text(value, limit):

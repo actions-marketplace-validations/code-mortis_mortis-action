@@ -1,7 +1,6 @@
 """Assess requirements from explicitly linked GitHub issues against a pinned PR diff."""
 
 import hashlib
-import html
 import http.client
 import json
 import os
@@ -10,7 +9,7 @@ import subprocess
 from urllib.parse import quote
 
 from .commands import DESCRIPTION_END, DESCRIPTION_START
-from .markdown import redact_credentials, safe_text
+from .markdown import contains_rendered_credential, redact_credentials, safe_text
 
 ISSUE_LIMIT = 3
 ASSESSMENT_LIMIT = 6
@@ -38,23 +37,39 @@ def _prose(body, *, list_items=False):
                   body or "", flags=re.DOTALL)
     text = re.sub(r"<!--.*?(?:-->|$)", "\n", text, flags=re.DOTALL)
     fence = ""
+    list_margins = [0]
     for line in text.splitlines():
-        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        expanded = line.expandtabs(4)
+        if not expanded.strip():
+            if not fence:
+                yield ""
+            continue
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        while list_margins[-1] > indent:
+            list_margins.pop()
+            fence = ""  # A fence inside a list ends with its item.
+        # Indented code starts four columns beyond the containing list item's content.
+        content = expanded[list_margins[-1]:]
+        if list_items and not fence and (marker := re.match(r"^ {0,3}(?:[-*+]|\d+[.)])(?: {1,4}(?=\S)| )", content)):
+            list_margins.append(list_margins[-1] + marker.end())
+            content = content[marker.end():]
+        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", content)
         if match:
             if not fence:
                 fence = match[1]
             elif match[1].startswith(fence) and not match[2].strip():
                 fence = ""
             continue
-        if not fence and not line.lstrip().startswith(">") and (list_items or not line.startswith(("\t", "    "))):
-            yield line
+        if fence or content.lstrip().startswith(">") or content.startswith("    "):
+            continue
+        yield line
 
 
 def references(api, body):
     repo = f"{api.owner}/{api.name}"
     url = os.environ["GITHUB_SERVER_URL"].rstrip("/") + "/" + repo + "/issues/"
     ref = rf"(?:{re.escape(url)}|(?:{re.escape(repo)})?#)([1-9][0-9]{{0,9}})(?![\w/#-])"
-    closing = re.compile(r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?)\s+" + ref, re.IGNORECASE)
+    closing = re.compile(r"\b(?:close[sd]?|fix(?:es|ed)?|resolve[sd]?):?\s+" + ref, re.IGNORECASE)
     following = re.compile(r"(?:\s*,\s*(?:and\s+)?|\s+and\s+)" + ref, re.IGNORECASE)
     numbers = {}
     for line in _prose(body):
@@ -166,7 +181,7 @@ def section(api, pr, report, previous_body, config, ask):
     root = f"{os.environ['GITHUB_SERVER_URL'].rstrip('/')}/{api.owner}/{api.name}"
     cached = {key: row for key, checksum, row in CACHE.findall(previous_body or "")
               if len(row.encode()) <= 1650 and checksum == _digest([key, row])
-              and redact_credentials(decoded := html.unescape(row)) == decoded}
+              and not contains_rendered_credential(row)}
     sections = ["", "", "### Linked issues"]
     checks = omitted = 0
     for number in numbers[:ISSUE_LIMIT]:

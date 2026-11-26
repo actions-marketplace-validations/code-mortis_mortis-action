@@ -1,6 +1,7 @@
 """Grounded linked-issue assessments and cross-run reuse."""
 
 import copy
+import json
 import os
 import unittest
 from unittest.mock import Mock, patch
@@ -68,12 +69,37 @@ class LinkedIssueTests(unittest.TestCase):
         self.assertEqual([c.args[1] for c in self.api.request.call_args_list],
                          ["/issues/2", "/issues/1", "/issues/3"])
 
+    def test_closing_keyword_with_colon_runs_the_assessment(self):
+        self.pr["body"] = "FIXES: #1. Resolves: other/repo#2."
+        self.section()
+        self.api.request.assert_called_once_with("GET", "/issues/1", allow_missing=True)
+        self.ask.assert_called_once()
+
     def test_prose_fallback_uses_visible_issue_text(self):
         self.issue["body"] = "Reject expired sessions.\n<!--" + "hidden note " * 900 + "-->"
         self.section()
         question = self.ask.call_args.args[0]
         self.assertIn("Reject expired sessions.", question)
         self.assertNotIn("hidden note", question)
+
+    def test_indented_code_is_excluded_and_nested_tasks_are_assessed(self):
+        for body, requirements in [
+            ("Render checklists as literal code.\n\n    - [ ] Buy milk\n\t- [ ] Buy bread",
+             ["Render checklists as literal code."]),
+            (("- Group\n    - [ ] Support nested tasks\n      in checklists\n\n"
+              "          - [ ] Example in the list item\n- [ ] Keep task order\n    \nA new paragraph."),
+             ["Support nested tasks in checklists", "Keep task order"]),
+            ("- Group\n    ```md\n    - [ ] Fenced example\n- [ ] Following task",
+             ["Following task"]),
+            ("- ```md\n  - [ ] Fenced example\n  ```\n  - [ ] Nested task after the fence",
+             ["Nested task after the fence"]),
+        ]:
+            with self.subTest(body=body):
+                self.ask.reset_mock()
+                self.issue["body"] = body
+                self.section()
+                questions = [json.loads(call.args[0].split("\n", 1)[1]) for call in self.ask.call_args_list]
+                self.assertEqual([question["requirement"] for question in questions], requirements)
 
     def test_reuses_matching_results_but_retries_unavailable(self):
         self.issue["body"] = "- [ ] First criterion\n- [x] Second"

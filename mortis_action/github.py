@@ -85,6 +85,7 @@ class GitHubAPI:
         return response["data"]
 
     def trusted_summary_body(self, comment):
+        """Return verified text, an empty string for untrusted content, or None if the read failed."""
         if not comment.get("node_id"):
             return ""
         try:
@@ -98,7 +99,7 @@ class GitHubAPI:
                 }
             """, {"id": comment["node_id"]})
         except (ValueError, OSError, http.client.HTTPException):
-            return ""
+            return None
         node = data.get("node") or {}
         if not {"editor", "author", "body", "lastEditedAt"} <= node.keys() or not mortis_bot(node["author"]):
             return ""
