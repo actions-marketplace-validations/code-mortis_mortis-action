@@ -6,13 +6,13 @@ Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons
 
 1. Copy [the review workflow](.github/workflows/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
 2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset for the bundled workflow](https://pypi.org/project/mortis-engine/0.1.7/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
-3. Pin the action to a reviewed commit SHA. The bundled workflow currently pins v0.2.2, which installs Engine 0.1.7.
+3. Pin the action to a reviewed commit SHA. The bundled workflow pins the published v0.2.2 release. Features marked v0.2.3 below are part of the release candidate. Both revisions install Engine 0.1.7.
 
 **Public GitHub.com repositories.** Starting December 2, 2026, automatic reviews using `pull_request_target` require an applicable Actions event policy. In your repository or organization's workflow execution protections, allow that event specifically for `.github/workflows/mortis-review.yml`. Policy Insights shows which runs the default rule would block. To keep the default protection, retain the `issue_comment` trigger and have a maintainer post `/mortis review` in the PR conversation. [GitHub announcement](https://github.blog/changelog/2026-11-02-pull_request_target-blocked-by-default-december-2/) · [Workflow execution settings](https://docs.github.com/en/actions/how-tos/administer/control-workflow-execution)
 
-Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. All reviews skip drafts. Dependabot PRs skip automatic review. With a reviewed Action SHA containing the v0.3.0 changes, a maintainer can request a review of a ready Dependabot PR with `/mortis review` or `/mortis review --full`. Other bot-authored PRs require `include_bot_prs = true`.
+Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. All reviews skip drafts. Dependabot PRs skip automatic review. With v0.2.3, a maintainer can request a review of a ready Dependabot PR with `/mortis review` or `/mortis review --full`. Other bot-authored PRs require `include_bot_prs = true`.
 
-On an Action revision that includes the full-review command, use `/mortis review --full` to review every eligible change once under the configured review limits. Mortis restores available finding history, bypasses incremental and identical-tree reuse for that run, and saves the result for subsequent reviews.
+With v0.2.3, use `/mortis review --full` to review every eligible change once under the configured review limits. Mortis restores available finding history, bypasses incremental and identical-tree reuse for that run, and saves the result for subsequent reviews.
 
 ### PR commands
 
@@ -23,7 +23,7 @@ With an action commit that installs Mortis Engine 0.1.5 or later, users with rep
 
 The bundled workflow handles commands through `issue_comment` using the workflow on the default branch. Ask and describe use the configured review model and the existing `contents: read` and `pull-requests: write` permissions.
 
-With a reviewed Action SHA containing the v0.3.0 changes, `/mortis preview` shows selected files, exclusions and reasons, planned batches, and configured limits. It reads the full comparison scope using the target revision's policy and needs no model, provider key, or saved review history. A question with a review comment permalink includes available earlier messages from the selected thread. The newest question takes precedence within the Engine's 8,000-character limit.
+With v0.2.3, `/mortis preview` shows selected files, exclusions and reasons, planned batches, and configured limits. It reads the full comparison scope using the target revision's policy and needs no model, provider key, or saved review history. A question with a review comment permalink includes available earlier messages from the selected thread. The newest question takes precedence within the Engine's 8,000-character limit.
 
 - Set the `MORTIS_REVIEW_FORKS` repository variable to `true` to enable automatic fork reviews. Fork activity can then trigger provider calls.
 - Set `MORTIS_UPLOAD_REPORTS` to `true` to retain JSON and Markdown as workflow artifacts for seven days. Reports can include source evidence.
@@ -49,7 +49,7 @@ Set `auto_resolve = true` under `[review]` in the target branch's `mortis.toml` 
 
 ### Inline delivery and merge checks
 
-Pin a reviewed Action SHA containing the v0.3.0 changes to use these settings. Inline findings are submitted as GitHub reviews with up to 25 comments each. Mortis leaves verified threads with replies open for the people discussing them. The sticky summary lists findings without a thread first and links overflow to the Actions run. If those entries exceed the job-summary limit, the run retains a sanitized Markdown index for seven days.
+These settings require v0.2.3. Inline findings are submitted as GitHub reviews with up to 25 comments each. Mortis leaves verified threads with replies open for the people discussing them. The sticky summary lists findings without a thread first and links overflow to the Actions run. If those entries exceed the job-summary limit, the run retains a sanitized Markdown index for seven days.
 
 | Action input | Default | Behavior |
 | --- | --- | --- |
@@ -135,13 +135,13 @@ jobs:
           command: scan
           provider: openai
           model: ${{ vars.MORTIS_MODEL }}
-          # After pinning a revision containing the v0.3.0 changes:
+          # Enable after updating the Action pin to v0.2.3:
           # retain-scan-findings: "true"
         env:
           MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
 ```
 
-The v0.3.0 scan summary shows severity counts and coverage. Enable `retain-scan-findings` to keep a seven-day Markdown artifact listing each finding's severity, title, and location at the scanned revision. People with access to the run's artifacts can download the index. Raw JSON and full Markdown reports are separate runner-local outputs.
+The v0.2.3 scan summary shows severity counts and coverage. Enable `retain-scan-findings` to keep a seven-day Markdown artifact listing each finding's severity, title, and location at the scanned revision. People with access to the run's artifacts can download the index. Raw JSON and full Markdown reports are separate runner-local outputs.
 
 ## Repository configuration and reports
 
@@ -165,7 +165,7 @@ The engine supplies defaults when the file is absent and rejects invalid configu
 
 The Actions summary shows status and coverage. The action exposes `status` (`completed`, `partial`, `failed`, or `skipped`), `run-id`, `report-json`, and `report-markdown`. Report outputs are runner-local paths for subsequent steps in the same job. Partial results keep their reports and return exit code 2. A later step can use `if: ${{ !cancelled() && steps.mortis.outputs.report-json != '' }}` to consume available reports, including after a failure. Reports may include source evidence. Successful analysis with findings exits 0.
 
-For a published PR review, `inline-posted` counts new inline comments, `inline-existing` counts findings with an existing comment, `summary-only` counts findings without an eligible location, and `inline-failed` counts delivery failures. The v0.3.0 contract adds `inline-routed` for findings routed to the summary by severity, and `policy-result` (`advisory`, `passed`, `blocked`, or `unevaluated`) for PR reviews. A completed analysis can produce `status=completed` and `policy-result=blocked` with a failing step. A partial run preserves exit code 2. Failure to publish the required summary or upload a requested index fails the job.
+Published PR reviews in v0.2.3 expose five delivery counts. `inline-posted` counts new inline comments, `inline-existing` counts findings with an existing comment, `summary-only` counts findings without an eligible location, and `inline-failed` counts delivery failures. The `inline-routed` output counts findings routed to the summary by severity. The separate `policy-result` output reports the severity decision (`advisory`, `passed`, `blocked`, or `unevaluated`). A completed analysis can produce `status=completed` and `policy-result=blocked` with a failing step. A partial run preserves exit code 2. Failure to publish the required summary or upload a requested index fails the job.
 
 ## Development
 

@@ -17,13 +17,15 @@ version is a runtime dependency.
   status in each affected checkout and preserve unrelated work. Use the
   [public-surface map](references/public-surface-map.md) to find affected callers,
   regressions and documentation.
-- Use the requested stable tag `vMAJOR.MINOR.PATCH` or propose one from the
-  verified changes. Compare the latest published release with the candidate
+- Use the stable tag requested by the maintainer. By default, increment only
+  the patch number of the latest published Action release. A minor or major
+  bump requires an explicit maintainer decision. Compare the latest published release with the candidate
   commit, including any in-scope working changes. Verify local tags against
   GitHub when available and report an unverified baseline as such.
 
 ## Write the GitHub release description
 
+Keep pending changes under `## Unreleased` until preparing a release.
 Edit the root `CHANGELOG.md` before tagging. Under `## Unreleased`, add or
 update one `## X.Y.Z - YYYY-MM-DD` heading for the proposed Action tag
 `vX.Y.Z`. Move the changes shipping in this version into that section. Keep
