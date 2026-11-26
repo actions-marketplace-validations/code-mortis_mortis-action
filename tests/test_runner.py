@@ -178,7 +178,7 @@ class RunnerTests(ActionTestCase):
         result, calls, _ = self.run_mock("review", settings, pr)
         self.assertEqual(result[:2], (2, "partial"))
         self.assertNotIn("--prior-findings", calls[-1])
-        self.assertIn("does not support PR finding verification", result[2])
+        self.assertIn("No saved review history was loaded to recheck earlier findings", result[2])
 
     def test_pr_review_restores_and_stages_encrypted_history_on_partial_results(self):
         pr = pr_event("a" * 40, "b" * 40)["pull_request"]
@@ -202,12 +202,15 @@ class RunnerTests(ActionTestCase):
 
     def test_incremental_without_a_key_still_reviews_the_pr(self):
         pr = pr_event("a" * 40, "b" * 40)["pull_request"]
-        settings = {"automatic": True, "include_bot_prs": False, "incremental": True, "model": ""}
+        settings = {"automatic": True, "include_bot_prs": False, "incremental": True, "auto_resolve": True, "model": ""}
         with patch.dict(os.environ, {"MORTIS_STATE_KEY": ""}):
             result, calls, _ = self.run_mock("review", settings, pr)
 
         self.assertEqual(result[:2], (2, "partial"))
         self.assertIn("Set MORTIS_STATE_KEY", result[2])
+        self.assertIn("This review ran without saved history", result[2])
+        self.assertNotIn("does not support PR finding verification", result[2])
+        self.assertNotIn("No saved review history was loaded", result[2])
         self.assertFalse(any("cryptography==50.0.2" in call for call in calls))
         self.assertNotIn("baseline-path=", self.outputs.read_text())
 
