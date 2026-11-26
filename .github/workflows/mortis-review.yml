@@ -16,6 +16,8 @@ jobs:
       actions: read
       contents: read
       pull-requests: write
+      # Enable with check-linked-issues on a revision that supports it.
+      # issues: read
     concurrency:
       group: mortis-review-${{ github.event.pull_request.number || github.event.issue.number }}
       queue: max
@@ -28,6 +30,10 @@ jobs:
           base-url: https://opencode.ai/zen/go/v1
           model: ${{ vars.MORTIS_MODEL }}
           review-forks: ${{ vars.MORTIS_REVIEW_FORKS }}
+          # Enable either option after updating the Action pin.
+          # auto-describe: "true"
+          # Check up to six requirements with the configured provider.
+          # check-linked-issues: "true"
         env:
           MORTIS_API_KEY: ${{ secrets.MORTIS_API_KEY }}
           MORTIS_STATE_KEY: ${{ secrets.MORTIS_STATE_KEY }}

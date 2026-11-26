@@ -1,5 +1,6 @@
 """Prepare and publish the ask and describe pull request commands."""
 
+import http.client
 import os
 import re
 from urllib.parse import quote
@@ -103,13 +104,40 @@ def description_body(original, report):
     if report.get("limited_context"):
         block += "\n\nThis summary uses the diff that fit within the configured context limit."
     block += f"\n{DESCRIPTION_END}"
-    if DESCRIPTION_START not in original and DESCRIPTION_END not in original:
-        return original + ("\n\n" if original else "") + block
-    if original.count(DESCRIPTION_START) == original.count(DESCRIPTION_END) == 1:
-        first, last = original.index(DESCRIPTION_START), original.index(DESCRIPTION_END)
-        if first < last:
-            return original[:first] + block + original[last + len(DESCRIPTION_END):]
-    raise ValueError("The existing Mortis description block is incomplete or duplicated.")
+    first, last = original.find(DESCRIPTION_START), original.find(DESCRIPTION_END)
+    if first == last == -1:
+        body = original + ("\n\n" if original else "") + block
+    elif 0 <= first < last and original.count(DESCRIPTION_START) == original.count(DESCRIPTION_END) == 1:
+        body = original[:first] + block + original[last + len(DESCRIPTION_END):]
+    else:
+        raise ValueError("The existing Mortis description block is incomplete or duplicated.")
+    if len(body) > 65_536:
+        raise ValueError("The Mortis summary would exceed GitHub's description limit.")
+    return body
+
+
+def auto_describe(api, pr, report):
+    summary = report.get("summary") or {}
+    if (report.get("status") != "completed" or summary.get("status") != "completed"
+            or not (summary.get("result") or {}).get("narrative")):
+        return ""
+    if any(report.get(f"{side}_sha") != pr[side]["sha"] for side in ("base", "head")):
+        return "Skipped the PR description update because the review covers different revisions."
+    original = pr.get("body") or ""
+    try:
+        body = description_body(original, summary)
+    except ValueError as error:
+        return str(error)
+    if body == original:
+        return ""
+    try:
+        current = api.current(report)
+        if not current or (current.get("body") or "") != original:
+            return "Skipped the PR description update because the PR changed during review."
+        api.request("PATCH", api.pull, {"body": body})
+    except (ValueError, OSError, http.client.HTTPException):
+        return "Mortis could not update the PR description. Check the workflow's pull request permissions."
+    return ""
 
 
 def finish_pr_command(api, pr, request, command, report):
@@ -127,8 +155,6 @@ def finish_pr_command(api, pr, request, command, report):
         return 0, "skipped", "The PR title or description was edited. Run /mortis describe again."
     title = report["result"]["title"]
     body = description_body(pr.get("body") or "", report)
-    if len(body) > 65_536:
-        raise ValueError("The Mortis summary would exceed GitHub's description limit.")
     if title != current.get("title") or body != (current.get("body") or ""):
         api.request("PATCH", api.pull, {"title": title, "body": body})
     return 0, "completed", "Mortis updated the PR title and description."

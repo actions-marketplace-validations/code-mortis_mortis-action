@@ -1,6 +1,7 @@
 """GitHub API access and persisted metadata for Mortis findings."""
 
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -12,6 +13,17 @@ BOT = "github-actions[bot]"
 COMMENT_BODY_LIMIT = 55_000
 FINDING_ID = re.compile(r"finding-[0-9a-f]{32}")
 FINDING_METADATA = "<!-- mortis-action:prior-finding:v1:"
+EVIDENCE_MARKER = re.compile(r"<!-- mortis-action:evidence:v1:([0-9a-f]{64}) -->")
+
+
+class GitHubRequestError(ValueError):
+    def __init__(self, method, status):
+        super().__init__(f"GitHub rejected the Mortis {method} request (HTTP {status}).")
+        self.status = status
+
+
+class GitHubForbidden(ValueError):
+    """GitHub explicitly denied an operation for this token."""
 
 
 class GitHubAPI:
@@ -50,7 +62,14 @@ class GitHubAPI:
             if response.status == 422 and allow_invalid_anchor:
                 return
             if not 200 <= response.status < 300:
-                raise ValueError(f"GitHub rejected the Mortis {method} request (HTTP {response.status}).")
+                if response.status == 403:
+                    try:
+                        message = json.loads(body).get("message", "")
+                    except (ValueError, AttributeError):
+                        message = ""
+                    if isinstance(message, str) and message.startswith("Resource not accessible by "):
+                        raise GitHubForbidden("GitHub denied this operation for the current token.")
+                raise GitHubRequestError(method, response.status)
             return json.loads(body)
         finally:
             connection.close()
@@ -58,9 +77,34 @@ class GitHubAPI:
     def graphql(self, query, variables):
         endpoint = urlsplit(os.environ["GITHUB_GRAPHQL_URL"])
         response = self._request(endpoint.netloc, "POST", endpoint.path, {"query": query, "variables": variables})
+        errors = response.get("errors", [])
+        if errors and all(error.get("type") == "FORBIDDEN" for error in errors):
+            raise GitHubForbidden("GitHub denied this operation for the current token.")
         if response.get("errors") or not response.get("data"):
-            raise ValueError("GitHub could not read or resolve Mortis review threads. Check pull-requests permissions.")
+            raise ValueError("GitHub could not complete the Mortis GraphQL request. Check workflow permissions.")
         return response["data"]
+
+    def trusted_summary_body(self, comment):
+        if not comment.get("node_id"):
+            return ""
+        try:
+            data = self.graphql("""
+                query($id: ID!) {
+                  node(id: $id) {
+                    ... on IssueComment {
+                      body lastEditedAt author { __typename login } editor { __typename login }
+                    }
+                  }
+                }
+            """, {"id": comment["node_id"]})
+        except (ValueError, OSError, http.client.HTTPException):
+            return ""
+        node = data.get("node") or {}
+        if not {"editor", "author", "body", "lastEditedAt"} <= node.keys() or not mortis_bot(node["author"]):
+            return ""
+        if (node["lastEditedAt"] or node["editor"]) and not mortis_bot(node["editor"]):
+            return ""
+        return node["body"] if isinstance(node["body"], str) else ""
 
     def download_artifact(self, artifact_id, limit):
         url = f"{self.endpoint.geturl().rstrip('/')}{self.repo}/actions/artifacts/{artifact_id}/zip"
@@ -81,7 +125,15 @@ class GitHubAPI:
                     nodes {
                       id
                       isResolved
-                      comments(first: 1) { nodes { body author { login __typename } } }
+                      isOutdated
+                      path
+                      line
+                      startLine
+                      diffSide
+                      startDiffSide
+                      comments(first: 1) {
+                        nodes { body lastEditedAt author { login __typename } editor { login __typename } }
+                      }
                     }
                     pageInfo { hasNextPage endCursor }
                   }
@@ -99,6 +151,12 @@ class GitHubAPI:
             for thread in page["nodes"]:
                 comments = thread["comments"]["nodes"]
                 if not thread["isResolved"] and comments and (finding := tracked_finding(comments[0])):
+                    line = thread.get("line")
+                    first = thread.get("startLine") or line
+                    if (thread.get("isOutdated") is False and thread.get("diffSide") == "RIGHT"
+                            and thread.get("startDiffSide") in {None, "RIGHT"}
+                            and type(first) is int and type(line) is int and 1 <= first <= line):
+                        finding["github_anchor"] = (thread["path"], first, line)
                     threads[thread["id"]] = finding
             if not page["pageInfo"]["hasNextPage"]:
                 return threads
@@ -142,22 +200,31 @@ class GitHubAPI:
         return bool(access and access["permission"] in {"admin", "write", "maintain"})
 
 
+def evidence_digest(content):
+    return hashlib.sha256(" ".join(content.split()).encode()).hexdigest()
+
+
 def finding_metadata(finding, head):
     identity = finding.get("id") or ""
     if not FINDING_ID.fullmatch(identity):
         return ""
+    evidence = f"<!-- mortis-action:evidence:v1:{evidence_digest(finding['content'])} -->\n"
     value = {key: finding[key] for key in ("id", "path", "start_line", "end_line", "severity")}
     value.update(source_sha=head, content=" ".join(finding["content"].split())[:400])
     encoded = base64.b64encode(json.dumps(value, separators=(",", ":")).encode()).decode()
-    return f"{FINDING_METADATA}{encoded} -->\n"
+    return f"{FINDING_METADATA}{encoded} -->\n{evidence}"
+
+
+def mortis_bot(author):
+    return bool(author and author.get("__typename") == "Bot" and author.get("login") in {BOT, "github-actions"})
 
 
 def tracked_finding(comment):
-    author = comment.get("author") or {}
-    if author.get("__typename") != "Bot" or author.get("login") not in {BOT, "github-actions"}:
+    if (not mortis_bot(comment.get("author"))
+            or ((comment.get("lastEditedAt") or comment.get("editor")) and not mortis_bot(comment.get("editor")))):
         return None
-    lines = comment["body"].split("\n", 2)
-    if len(lines) != 3 or not lines[0].startswith("<!-- mortis-action:finding:"):
+    lines = comment["body"].split("\n", 3)
+    if len(lines) < 3 or not lines[0].startswith("<!-- mortis-action:finding:"):
         return None
     marker = lines[1]
     if not marker.startswith(FINDING_METADATA) or not marker.endswith(" -->") or len(marker) > COMMENT_BODY_LIMIT:
@@ -174,6 +241,8 @@ def tracked_finding(comment):
             and finding["severity"] in {"low", "medium", "high", "critical"}
             and isinstance(finding["content"], str) and 0 < len(finding["content"]) <= 400
         ):
+            if match := EVIDENCE_MARKER.fullmatch(lines[2]):
+                finding["evidence_digest"] = match[1]
             return finding
     except (KeyError, TypeError, ValueError):
         return None
