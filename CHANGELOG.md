@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-- Upgrade to Mortis Engine 0.1.7. Incremental reviews recheck Python importers when a module-level function’s required parameters change or it gains or loses `*args` or `**kwargs`. The first review after upgrading establishes a new baseline.
+## 0.2.2 - 2026-11-26
+
+Mortis Action now installs Mortis Engine 0.1.7. The first incremental PR review after upgrading reviews the full diff to establish a new baseline. Keep your existing `MORTIS_STATE_KEY` and workflow permissions.
+
+- Incremental reviews recheck previously reviewed Python importers when a module-level function’s required parameters change or it gains or loses `*args` or `**kwargs`. Fully reverting a previously reviewed file change triggers a fresh review of the remaining diff when prior coverage would otherwise be reused.
+- When a Python module under `src/` is deleted or renamed, reviews can find absolute imports of that module in unchanged files.
 - GitHub release drafts now use the tagged version’s changelog entry as their description.
 
 ## 0.2.1 - 2026-11-26
