@@ -6,10 +6,10 @@ import shutil
 import subprocess
 import tarfile
 
-TRIVY_VERSION = "0.76.0"
+TRIVY_VERSION = "0.76.2"
 TRIVY_ASSETS = {
-    "X64": ("64bit", "e24b1c51293c1b15e4ba8d45bbc7891ba053f90278ec2698f3562c993e145fe7"),
-    "ARM64": ("ARM64", "aab21e677a7b7071fc79f1711480840754c18a1b9d9cefa7ccd06af63a0e8f4c"),
+    "X64": ("64bit", "bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf"),
+    "ARM64": ("ARM64", "ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3"),
 }
 
 

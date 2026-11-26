@@ -69,7 +69,7 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
     )
     subprocess.run([sys.executable, "-I", "-m", "venv", directory / "venv"], check=True, env=environment)
     bin_dir = directory / "venv/bin"
-    packages = ["mortis-engine==0.1.5"]
+    packages = ["mortis-engine==0.1.6"]
     state_secret = os.environ.get("MORTIS_STATE_KEY", "")
     if pr and command == "review":
         packages.append("PyYAML==6.0.3")
