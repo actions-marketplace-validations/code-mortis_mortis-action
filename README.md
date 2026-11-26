@@ -1,11 +1,11 @@
 # Mortis Action
 
-Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. This revision installs Mortis Engine 0.1.6 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
+Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. This revision installs Mortis Engine 0.1.7 on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
 
 ## Review pull requests
 
 1. Copy [the review workflow](.github/workflows/mortis-review.yml) to `.github/workflows/mortis-review.yml` on your default branch.
-2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.6/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
+2. Add the `MORTIS_API_KEY` repository secret and set the action's `provider` to an [Engine provider preset](https://pypi.org/project/mortis-engine/0.1.7/#connect-with-environment-variables). Set the `MORTIS_MODEL` repository variable if `mortis.toml` does not set a review model.
 3. Pin the action to a reviewed commit SHA. The workflow includes the SHA used by this repository.
 
 Same-repository PRs are reviewed automatically. A user with repository write access can post `/mortis review` as a new PR comment to review the current head, including on forks. The `[review].automatic` setting controls automatic runs. Drafts and Dependabot PRs are skipped. Other bot-authored PRs require `include_bot_prs = true`.
@@ -39,7 +39,7 @@ Existing `pull_request` workflows can continue reviewing same-repository PRs wit
 
 ### Incremental pull request reviews
 
-Set `incremental = true` under `[review]` in the target branch's `mortis.toml`. The first run and the first run after an Engine upgrade review the full PR. Subsequent runs can reuse coverage for unchanged files from a compatible, fully covered review. With Engine 0.1.6, a changed tree with an eligible deletion or rename triggers a full review to check surviving callers, including in eligible unchanged files. Set `skip_unchanged = true` to reuse compatible coverage when the head tree is identical, including complete caller coverage. The job summary and PR comment list reviewed and reused files. The PR comment also keeps earlier open findings from the saved history.
+Set `incremental = true` under `[review]` in the target branch's `mortis.toml`. The first run and the first run after an Engine upgrade review the full PR. Subsequent runs can reuse coverage for unchanged files from a compatible, fully covered review. A changed tree with an eligible deletion or rename triggers a full review to check surviving callers, including in eligible unchanged files. Set `skip_unchanged = true` to reuse compatible coverage when the head tree is identical, including complete caller coverage. The job summary and PR comment list reviewed and reused files. The PR comment also keeps earlier open findings from the saved history.
 
 Generate a key with `openssl rand -base64 32` and store it as the `MORTIS_STATE_KEY` repository secret. The bundled workflow passes the key to the action and grants `actions: read`. For a custom workflow, add those settings and serialize review jobs per PR using a concurrency group. Use an action revision that includes incremental review support.
 
