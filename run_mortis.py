@@ -224,8 +224,12 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
         except (ValueError, OSError, http.client.HTTPException):
             checkpoint = None
             output("history-unavailable", "true")
-            state_note = ("\n\nReview history could not be restored. Set MORTIS_STATE_KEY to the original "
-                          "base64-encoded 32-byte secret and check Actions read permissions.")
+            if state_secret.strip():
+                state_note = ("\n\nThis review ran without saved history. Check the original MORTIS_STATE_KEY "
+                              "and Actions read permissions to restore earlier findings.")
+            else:
+                state_note = ("\n\nThis review ran without saved history. Set MORTIS_STATE_KEY to a "
+                              "base64-encoded 32-byte secret to keep findings between runs.")
     if api and settings.get("auto_resolve"):
         if "--prior-findings" in mortis("review", "--help").stdout:
             try:
@@ -257,8 +261,8 @@ def run_engine(args, repo, revision, pr, reports, directory, *, manual=False, re
                 threads = api.finding_threads()
             except (ValueError, OSError, http.client.HTTPException):
                 resolution_note = "\n\nMortis could not load the GitHub threads for automatic resolution."
-        else:
-            resolution_note = "\n\nThe installed Mortis Engine does not support PR finding verification."
+        elif not state_note:
+            resolution_note = "\n\nNo saved review history was loaded to recheck earlier findings."
     report_json = reports / "report.json"
     report_markdown = reports / "report.md"
     result = mortis(
