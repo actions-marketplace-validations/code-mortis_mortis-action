@@ -1,6 +1,6 @@
 ---
 name: mortis-action-release
-description: Prepare or audit a Mortis Action release. Verify the composite action and its pinned Engine, reconcile repository and site guides, and prepare notes for the GitHub release draft. Use for Action release preparation and readiness checks. Publication requires separate authorization.
+description: Prepare or audit a Mortis Action release. Verify the composite action and its pinned Engine, reconcile repository and site guides, and write the versioned changelog entry used as the GitHub release description. Publication requires separate authorization.
 ---
 
 # Mortis Action release preparation
@@ -21,10 +21,19 @@ version is a runtime dependency.
   verified changes. Compare the latest published release with the candidate
   commit, including any in-scope working changes. Verify local tags against
   GitHub when available and report an unverified baseline as such.
-- Draft notes from the actual changes and regressions. Cover consumer-visible
-  changes to inputs, outputs, workflow permissions, runner requirements, pinned
-  dependencies and known limitations. Link exact revisions for claims that
-  depend on a particular version.
+
+## Write the GitHub release description
+
+Edit the root `CHANGELOG.md` before tagging. Under `## Unreleased`, add or
+update one `## X.Y.Z - YYYY-MM-DD` heading for the proposed Action tag
+`vX.Y.Z`. Move the changes shipping in this version into that section. Keep
+older releases in newest-first order and preserve their entries.
+
+Write the section body for Action users. Summarize what changed since the
+preceding release and any upgrade steps. Include changes to inputs, outputs,
+permissions, runner requirements, dependency pins and known limitations when
+relevant. Use `###` for subsections. The workflow uses this Markdown verbatim
+as the draft description, with the tag as the release title.
 
 ## Synchronize the Action and its documentation
 
@@ -75,15 +84,19 @@ listing are available.
 - For affected site pages, run `bun install --frozen-lockfile`, `bun run check`,
   `bun run build`, then `bun test`. The tests read generated `dist/` pages.
   Verify rendered examples, release pins, compatibility notes and bookmarks.
-- Provide the proposed tag, preceding release, draft notes, changed repository
-  and site surfaces, checks run and any pending work.
+- From the repository root, preview the release description with
+  `python3 scripts/release_notes.py vX.Y.Z` using the proposed tag. Check
+  the Markdown and include the changelog entry in the release diff.
+- Provide the proposed tag, preceding release, link to the changelog section,
+  changed repository and site surfaces, checks run and any pending work.
 
 ## Publication boundary
 
 With explicit authorization, a new stable tag on a reviewed commit on `main`
 triggers the Action release workflow. It checks the tag's commit and main
-ancestry, runs CI on the tagged commit, and creates or reuses a GitHub release
-draft. Verify the draft points to the intended tag and review its generated notes.
+ancestry, runs CI and extracts the matching changelog entry from that commit.
+It creates a GitHub release draft or refreshes the matching draft's description
+on a rerun. Verify the tag and compare the draft body with the local preview.
 The maintainer publishes the draft with **Publish this Action to the GitHub
 Marketplace** selected. Verify the tag, public release and Marketplace listing
 before switching public examples to that release.

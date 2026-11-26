@@ -137,9 +137,10 @@ Use Python 3.15 and follow the [contribution guide](CONTRIBUTING.md) to install 
 
 Use the project-local [release preparation skill](.agents/skills/mortis-action-release/SKILL.md),
 `$mortis-action-release` in Codex, to check Engine compatibility, update the
-Action guides, and prepare release notes.
+Action guides, and write the release description in [CHANGELOG.md](CHANGELOG.md)
+under `## X.Y.Z - YYYY-MM-DD`.
 
-Push a new `vMAJOR.MINOR.PATCH` tag from `main`. The release workflow runs CI on that commit and creates a GitHub release draft with generated notes. Open the draft, select **Publish this Action to the GitHub Marketplace**, and publish the release.
+Include the changelog entry in the commit on `main` that you tag. Push the new `vX.Y.Z` tag to run CI and create a GitHub release draft from that version’s entry. Open the draft, select **Publish this Action to the GitHub Marketplace**, and publish the release.
 
 ## Security
 

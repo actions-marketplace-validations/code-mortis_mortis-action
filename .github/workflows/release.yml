@@ -49,17 +49,30 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.ref_name }}
       RELEASE_COMMIT: ${{ needs.guard.outputs.commit }}
     steps:
-      - name: Draft release with generated notes
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.guard.outputs.commit }}
+          persist-credentials: false
+      - name: Extract the tagged changelog entry
+        run: python3 scripts/release_notes.py "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+      - name: Draft release from the changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           test "$(gh api "repos/$GH_REPO/commits/refs/tags/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
-          release_url=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
-            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .html_url")
-          if [[ -z "$release_url" ]]; then
-            release_url=$(gh release create "$RELEASE_TAG" --draft --verify-tag --generate-notes)
+          existing=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | [.html_url, .draft] | @tsv")
+          notes="$RUNNER_TEMP/release-notes.md"
+          if [[ -z "$existing" ]]; then
+            release_url=$(gh release create "$RELEASE_TAG" --draft --verify-tag --title "$RELEASE_TAG" --notes-file "$notes")
+          else
+            IFS=$'\t' read -r release_url is_draft <<< "$existing"
+            if [[ "$is_draft" == true ]]; then
+              gh release edit "$RELEASE_TAG" --notes-file "$notes"
+            fi
           fi
           printf '[Open the GitHub release for `%s`](%s)\n' "$RELEASE_TAG" "$release_url" >> "$GITHUB_STEP_SUMMARY"
