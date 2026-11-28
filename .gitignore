@@ -6,3 +6,5 @@
 __pycache__/
 *.py[cod]
 reports/
+graphify-out/
+.claude/settings.local.json
