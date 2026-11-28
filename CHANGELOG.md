@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Upgrade to Mortis Engine 0.1.8. The first incremental PR review checks the full diff and preserves open findings from encrypted review history. Subsequent reviews recheck previously reviewed Python importers when a module-level function is removed, switches between sync and async, or changes how existing calls bind arguments.
+
 ## 0.2.3 - 2026-11-26
 
 Upgrading from v0.2.2 keeps Mortis Engine 0.1.7, Trivy 0.76.2, and the Linux runner requirement. Keep your existing provider, model, and `MORTIS_STATE_KEY`. To pick up the new event filters, update your copy of the bundled review workflow as well as the Action pin.

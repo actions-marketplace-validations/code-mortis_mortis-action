@@ -1,6 +1,6 @@
 # Mortis Action
 
-Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. This revision installs [Mortis Engine 0.1.7](https://pypi.org/project/mortis-engine/0.1.7/) on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
+Run Mortis Engine on GitHub Actions for pull request reviews, branch comparisons, and security scans. This revision installs [Mortis Engine 0.1.8](https://pypi.org/project/mortis-engine/0.1.8/) on a Linux runner and uses your AI provider connection. Engine analysis sends eligible source and diffs to that provider.
 
 ## Review pull requests
 
@@ -69,7 +69,7 @@ Existing `pull_request` workflows can continue reviewing same-repository PRs wit
 
 Set `incremental = true` under `[review]` in the target branch's `mortis.toml`. The first run and the first run after an Engine upgrade review the full PR. Subsequent runs can reuse coverage for unchanged files from a compatible, fully covered review. A changed tree with an eligible deletion or rename triggers a full review to check surviving callers, including in eligible unchanged files.
 
-With Engine 0.1.7, incremental reviews also recheck previously reviewed Python importers when a module-level function’s required parameters change or it gains or loses `*args` or `**kwargs`. Fully reverting a previously reviewed file change can trigger a fresh review of the remaining diff.
+With Engine 0.1.8, incremental reviews recheck previously reviewed Python importers when a module-level function is removed, switches between sync and async, or changes how existing calls bind arguments. Adding a compatible optional parameter still allows reuse. Fully reverting a previously reviewed file change can trigger a fresh review of the remaining diff.
 
 Set `skip_unchanged = true` to reuse compatible coverage when the head tree is identical, including complete caller coverage. The job summary and PR comment list reviewed and reused files and the reason for reuse. The PR comment keeps its previous change overview when identical content was already reviewed, along with earlier open findings from saved history.
 
